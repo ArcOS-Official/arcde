@@ -44,6 +44,10 @@ The shell links against the `ui/` DVUI fork through a path dependency;
 
 ## Running
 
+From a TTY: `./scripts/arc-tty` starts nile with nshell as its startup
+command (extra args pass to nile; `ARC_CMD` overrides the command,
+`ARC_NILE`/`ARC_NSHELL` override binary resolution).
+
 Start `nile` from a TTY (KMS/DRM) or nested in an existing session. It
 spawns `$XDG_CONFIG_HOME/river/init` if present. `nshell` connects over
 `/tmp/arcos/nilebank.sock` (see `bank/src/root.zig`) and draws the bar and

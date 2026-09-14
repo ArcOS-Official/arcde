@@ -1,0 +1,60 @@
+#!/bin/sh
+# arc-tty: launch the arc session (nile compositor + nshell) from a TTY.
+#
+# Usage: ./scripts/arc-tty [nile args...]
+#   Extra args pass straight to nile (e.g. -log-level debug).
+#   ARC_CMD overrides the startup command (default: nshell).
+#   ARC_NILE / ARC_NSHELL override binary resolution.
+#
+# The script execs nile, so signals go to the compositor. Nile runs the
+# startup command with WAYLAND_DISPLAY pointed at its own socket and kills
+# the whole process group on exit, so no cleanup trap is needed here.
+# nshell reconnects on its own if the bank socket is not up yet.
+set -eu
+
+root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+
+resolve() {
+    name="$1"
+    override="$2"
+    if [ -n "$override" ] && [ -x "$override" ]; then
+        printf '%s\n' "$override"
+        return 0
+    fi
+    if cmd_path="$(command -v "$name" 2>/dev/null)" && [ -x "$cmd_path" ]; then
+        printf '%s\n' "$cmd_path"
+        return 0
+    fi
+    if [ -x "$root/zig-out/bin/$name" ]; then
+        printf '%s\n' "$root/zig-out/bin/$name"
+        return 0
+    fi
+    return 1
+}
+
+nile="$(resolve nile "${ARC_NILE:-}")" || {
+    echo "arc-tty: nile not found (set ARC_NILE, install it, or zig build first)" >&2
+    exit 1
+}
+nshell="$(resolve nshell "${ARC_NSHELL:-}")" || {
+    echo "arc-tty: nshell not found (set ARC_NSHELL, install it, or zig build first)" >&2
+    exit 1
+}
+
+# Wayland clients (and wlroots) require XDG_RUNTIME_DIR. Logind normally
+# provides /run/user/$UID; fall back to a private dir under /tmp.
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    if [ -d "/run/user/$(id -u)" ]; then
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    else
+        export XDG_RUNTIME_DIR="/tmp/arc-runtime-$(id -u)"
+        mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
+    fi
+fi
+
+if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+    echo "arc-tty: warning: WAYLAND_DISPLAY/DISPLAY already set, session will nest" >&2
+fi
+
+cmd="${ARC_CMD:-$nshell}"
+exec "$nile" -c "$cmd" "$@"

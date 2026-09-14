@@ -102,9 +102,9 @@ om: OutputManager,
 idle_inhibit_manager: IdleInhibitManager,
 lock_manager: LockManager,
 wm: WindowManager,
-    xkb_bindings: XkbBindings,
-    layer_shell: LayerShell,
-    workspace: Workspace.Manager,
+xkb_bindings: XkbBindings,
+layer_shell: LayerShell,
+workspace: Workspace.Manager,
 
 xwayland: if (build_options.xwayland) ?*wlr.Xwayland else void = if (build_options.xwayland) null,
 new_xsurface: if (build_options.xwayland) wl.Listener(*wlr.XwaylandSurface) else void =

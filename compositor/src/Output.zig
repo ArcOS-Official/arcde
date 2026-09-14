@@ -163,11 +163,11 @@ lock_render_state: enum {
 link: wl.list.Link,
 
 /// State to be sent to the wm in the next manage sequence.
-    scheduled: State,
-    /// State sent to the wm in the latest manage sequence.
-    sent: State,
-    link_sent: wl.list.Link,
-    /// Rendering state requested by the window manager.
+scheduled: State,
+/// State sent to the wm in the latest manage sequence.
+sent: State,
+link_sent: wl.list.Link,
+/// Rendering state requested by the window manager.
 rendering_requested: RenderingState = .init,
 /// State applied to the wlr_output and rendered.
 current: State,

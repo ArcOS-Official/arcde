@@ -86,7 +86,6 @@ pub fn build(b: *std.Build) !void {
         .test_step = test_step,
         .check_step = check_step,
     });
-
 }
 
 const CompositorOptions = struct {

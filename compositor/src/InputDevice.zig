@@ -161,5 +161,3 @@ fn handleRemove(listener: *wl.Listener(*wlr.InputDevice), _: *wlr.InputDevice) v
         .@"switch", .tablet_pad => unreachable,
     }
 }
-
-

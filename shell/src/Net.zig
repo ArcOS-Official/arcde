@@ -1799,7 +1799,7 @@ fn activateSaved(self: *Net, bus: *Dbus.Bus, c: *ConnectSaved) bool {
         .path = nm_path,
         .interface = nm_iface,
         .member = "ActivateConnection",
-    }, .{Dbus.obj(conn_z), Dbus.obj(dev_z), Dbus.obj(ap_z)}) orelse return false;
+    }, .{ Dbus.obj(conn_z), Dbus.obj(dev_z), Dbus.obj(ap_z) }) orelse return false;
     defer m.deinit();
     var r = m.send(bus) orelse {
         self.setError("connect: {s}", .{Dbus.errorText(&m.err)});

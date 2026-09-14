@@ -22,7 +22,7 @@ pub const LayerShellOpts = struct {
     /// Per the protocol, omitting an axis centers on it: anchor `.top`
     /// only → horizontally centered bar; anchor `.left` only → vertically
     /// centered panel. `center` below forces this explicitly.
-    anchors: [4]?Anchor = .{null}**4,
+    anchors: [4]?Anchor = .{null} ** 4,
     /// Explicit centering. Overrides `anchors` on that axis by clearing
     /// it: `.horizontal`/`.both` clears left/right, `.vertical`/`.both`
     /// clears top/bottom. Combine with `anchors` for e.g. top-anchored +
@@ -31,7 +31,7 @@ pub const LayerShellOpts = struct {
     center: Center = .none,
     /// Margins for anchored edges: [top, right, bottom, left]. Only affects
     /// edges you are anchored to. Doubles as position offset for `moveTo`.
-    padding: [4]i32 = .{0}**4,
+    padding: [4]i32 = .{0} ** 4,
     layer: Layer = .top,
     exclusive_zone: i32 = 0,
     namespace: [:0]const u8 = "dvui-layer",

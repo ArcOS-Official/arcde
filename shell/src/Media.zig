@@ -300,7 +300,8 @@ pub fn active(self: *Media) bool {
         (self.title.len > 0 or self.length_us > 0);
 }
 
-pub fn snapshotCopy(self: *Media, alloc: std.mem.Allocator) Snapshot {    var out = Snapshot{};
+pub fn snapshotCopy(self: *Media, alloc: std.mem.Allocator) Snapshot {
+    var out = Snapshot{};
     if (!self.inited) return out;
     self.mu.lockUncancelable(self.io);
     defer self.mu.unlock(self.io);

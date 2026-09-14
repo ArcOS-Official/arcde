@@ -7,7 +7,7 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 
 Nile replaces River's custom Wayland protocols with ordinary Zig functions. This document describes the function API, migration path, and examples.
 
-> **Status:** Stable. The six legacy River Wayland globals (`river_window_manager_v1`, `river_xkb_bindings_v1`, `river_layer_shell_v1`, `river_input_management_v1`, `river_libinput_config_v1`, `river_xkb_config_v1`) and their XML files (`protocol/river-*.xml`) have been **removed**. All compositor control is via `river/Nile.zig`. The code that previously generated and advertised those globals has been deleted from `build.zig` and `river/*.zig`.
+> **Status:** Stable. The six legacy River Wayland globals (`river_window_manager_v1`, `river_xkb_bindings_v1`, `river_layer_shell_v1`, `river_input_management_v1`, `river_libinput_config_v1`, `river_xkb_config_v1`) and their XML files (`protocol/river-*.xml`) have been **removed**. All compositor control is via `compositor/src/Nile.zig`. The code that previously generated and advertised those globals has been deleted from `build.zig` and `compositor/src/*.zig`.
 
 ---
 
@@ -28,14 +28,14 @@ Benefits:
 ## Module layout
 
 ```
-river/Nile.zig          — public façade, re-exports sub-APIs
-river/Window.zig        — window state (now driven via Nile.Window)
-river/Output.zig        — output state (Nile.Output)
-river/Seat.zig          — seat/focus/cursor (Nile.Seat)
-river/InputDevice.zig   — input devices (Nile.Input)
-river/XkbBinding.zig    — key bindings (Nile.Seat.addXkbBinding)
-river/LayerShell*.zig   — layer shell (Nile.Layer)
-river/Workspace.zig     — workspace management (Nile.Workspace)
+compositor/src/Nile.zig          — public façade, re-exports sub-APIs
+compositor/src/Window.zig        — window state (now driven via Nile.Window)
+compositor/src/Output.zig        — output state (Nile.Output)
+compositor/src/Seat.zig          — seat/focus/cursor (Nile.Seat)
+compositor/src/InputDevice.zig — input devices (Nile.Input)
+compositor/src/XkbBinding.zig — key bindings (Nile.Seat.addXkbBinding)
+compositor/src/LayerShell*.zig — layer shell (Nile.Layer)
+compositor/src/Workspace.zig — workspace management (Nile.Workspace)
 ```
 
 Standard Wayland / wlroots protocols (`xdg_shell`, `wlr_layer_shell`, `ext_session_lock`, etc.) are **unchanged**. Only the six `river_*` protocols have been removed.
@@ -63,7 +63,7 @@ From the caller perspective this is synchronous: call functions, optionally call
 ## Quick start
 
 ```zig
-const Nile = @import("river/Nile.zig");
+const Nile = @import("compositor/src/Nile.zig");
 
 pub fn arrange() void {
     const out = Nile.Output.primary() orelse return;
@@ -346,7 +346,7 @@ Create a Zig module that imports `Nile` and hooks into events. The simplest inte
 Example `init.zig` (planned):
 
 ```zig
-const Nile = @import("river/Nile.zig");
+const Nile = @import("compositor/src/Nile.zig");
 
 export fn onWindowMap(win: *Nile.Window) void {
     // Master-stack layout: first window is master (60% width)
@@ -368,7 +368,7 @@ The old external window manager protocol has been deleted. External WMs like `ti
 zig build docs  # (future) generates `docs/nile-api.html` via `zig doc`
 ```
 
-Inline `///` comments in `river/Nile.zig` are the source of truth; this markdown is an overview.
+Inline `///` comments in `compositor/src/Nile.zig` are the source of truth; this markdown is an overview.
 
 ---
 

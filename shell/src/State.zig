@@ -17,11 +17,11 @@ const State = @This();
 // and via request_keyboard_focus so opening a menu takes focus.
 pub const shell_namespace = "nshell-hub";
 
-// Request/response socket served by ../nile (`Bank.socket_id = "compositor"`).
+// Request/response socket served by the compositor (`Bank.socket_id = "compositor"`).
 // The same connection doubles as the push channel: the server broadcasts
 // unsolicited events (`Header.push_id`) over it, and nilebank's reader fiber
 // routes those to our event listener instead of an outstanding `request`
-// (see ../nile/doc/nile-api.md "Shell event push").
+// (see docs/nile-api.md "Shell event push").
 const socket_path = "/tmp/arcos/compositor.sock";
 
 // Freshness/coalescing window for windowImage(): a cached capture younger
@@ -195,7 +195,7 @@ notif: Notif = .{},
 capture_backoff_until_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
 // Test override for the socket path (live code always uses the canonical
-// ../nile paths above).
+// compositor paths above).
 socket_path_override: ?[]const u8 = null,
 
 // Focus-window behaviour: whether focusing a window on another workspace
@@ -755,7 +755,7 @@ fn dropConn(self: *State) void {
 // Worker-only. Initial state after every (re)connect: the server answers
 // with full lists, which update() adopts. Later broadcasts override them.
 // shell_register runs first (re-registration after every reconnect, since
-// the compositor forgets it on restart): it tells ../nile which layer
+// the compositor forgets it on restart): it tells the compositor which layer
 // surface to focus on MOD press, and acks with pong (dropped here).
 fn initialQuery(self: *State, conn: *nilebank.Connection) void {
     if (conn.requestCompositor(.{ .shell_register = .{ .namespace = shell_namespace } }, .raw)) |*ev| {
@@ -1324,7 +1324,7 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
             // Unknown workspace: fetch via upsert fallback (rare).
             // Leave as-is; next full list will converge.
         },
-        // MOD-tap launcher gesture (see ../nile Seat.shellModTap):
+        // MOD-tap launcher gesture (see compositor/src/Seat.zig shellModTap):
         // launcher_opened/launcher_closed are for the app launcher, not
         // the window switcher. hubFrame owns its own simple hub_* var
         // (like hub_keyboard_focused) if it wants local switcher state.

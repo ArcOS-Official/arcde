@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try frame();
         if (frames >= 20 and frames < 24) {
             std.debug.print("reject: since={d} ap={d} sel={?d} now={d}\n", .{
-                g_hub.net_reject_since, g_hub.net_reject_ap, g_hub.net_sel,
+                g_hub.net_reject_since,                                         g_hub.net_reject_ap, g_hub.net_sel,
                 @as(u64, @intCast(std.Io.Clock.real.now(io).toMilliseconds())),
             });
             // Wiggle window: entry x should oscillate around its slot.

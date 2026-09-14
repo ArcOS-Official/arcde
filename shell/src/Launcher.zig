@@ -510,9 +510,9 @@ pub fn tick(self: *Launcher) !void {
 // ---------------------------------------------------------------------------
 
 const icon_size_dirs = [_][]const u8{
-    "32x32", "32x32@2", "24x24", "48x48", "36x36", "22x22",
-    "16x16", "64x64", "24x24@2", "48x48@2", "128x128",
-    "256x256", "512x512",
+    "32x32",   "32x32@2", "24x24",   "48x48",   "36x36",   "22x22",
+    "16x16",   "64x64",   "24x24@2", "48x48@2", "128x128", "256x256",
+    "512x512",
 };
 // NOTE: "scalable" omitted on purpose — it holds .svg only, which the
 // raster pipeline can't use; probing it would only burn stats.

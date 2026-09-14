@@ -1295,7 +1295,6 @@ pub fn textEntry(src: std.builtin.SourceLocation, init_opts: AlignedEntry.InitOp
     return ret;
 }
 
-
 // No test blocks here on purpose: this file is never a test-step
 // root (see build.zig), and this toolchain only collects tests from
 // the root file — copied upstream tests would compile but never run.

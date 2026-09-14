@@ -4,7 +4,7 @@ const nilebank = @import("bank");
 const proto = nilebank.protocols.compositor;
 const State = @import("State.zig");
 
-// Headless tests for the 2-way nilebank API (see ../nilebank, ../nile Bank.zig):
+// Headless tests for the 2-way bank API (see bank/, compositor/src/Bank.zig):
 // one connection carries requests and server broadcasts; the reader fiber
 // feeds the commit queue, update() applies, worker sends.
 

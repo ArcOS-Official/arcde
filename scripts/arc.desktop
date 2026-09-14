@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Arc Desktop
+Comment=Arc Wayland desktop (nile compositor + nshell)
+Exec=launch-arc
+Type=Application
+DesktopNames=Arc

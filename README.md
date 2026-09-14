@@ -42,11 +42,30 @@ for Xwayland support in the compositor.
 The shell links against the `ui/` DVUI fork through a path dependency;
 `git submodule update --init` after cloning.
 
+## Installing
+
+`./scripts/install.sh` builds (`-Dllvm=true -Doptimize=ReleaseSafe` by
+default) and installs everything a session needs:
+
+```
+sudo ./scripts/install.sh               # system install to /usr/local
+./scripts/install.sh --user             # user install to ~/.local
+./scripts/install.sh --user --xwayland  # user install + Xwayland support
+sudo ./scripts/install.sh --uninstall   # remove a system install
+```
+
+This puts `nile` + `nshell` in `<prefix>/bin`, the `launch-arc` session
+launcher beside them, and an `arc.desktop` entry in
+`<prefix>/share/wayland-sessions`, so display managers (GDM, SDDM,
+LightDM) offer **Arc Desktop** at login. See `./scripts/install.sh
+--help` for `--prefix`, `--debug`, and `-D` passthrough to `zig build`.
+
 ## Running
 
-From a TTY: `./scripts/arc-tty` starts nile with nshell as its startup
-command (extra args pass to nile; `ARC_CMD` overrides the command,
-`ARC_NILE`/`ARC_NSHELL` override binary resolution).
+From a TTY: `launch-arc` starts nile with nshell as its startup command
+(extra args pass to nile; `ARC_CMD` overrides the command,
+`ARC_NILE`/`ARC_NSHELL` override binary resolution). From a display
+manager: pick **Arc Desktop** at the login screen.
 
 Start `nile` from a TTY (KMS/DRM) or nested in an existing session. It
 spawns `$XDG_CONFIG_HOME/river/init` if present. `nshell` connects over

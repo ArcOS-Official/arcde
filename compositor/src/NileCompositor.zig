@@ -441,12 +441,18 @@ pub const NileCompositor = struct {
             _ = b;
         }
         // MOD+f: toggle focused window forced-floating
+        // MOD+Shift+f: toggle focused window fullscreen
         {
             const b = Nile.Seat.addXkbBinding(seat, xkb.Keysym.f, mod) catch |err| {
                 log.warn("failed to register window floating toggle binding: {}", .{err});
                 return;
             };
             _ = b;
+            const b_fs = Nile.Seat.addXkbBinding(seat, xkb.Keysym.f, shift_mod) catch |err| {
+                log.warn("failed to register window fullscreen toggle binding: {}", .{err});
+                return;
+            };
+            _ = b_fs;
         }
     }
 
@@ -650,6 +656,7 @@ pub const NileCompositor = struct {
             }
         }
         // MOD+f: toggle focused window forced-floating (no shift)
+        // MOD+Shift+f: toggle focused window fullscreen
         if (binding.keysym == xkb.Keysym.f) {
             const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
             if (!mods.shift) {
@@ -657,6 +664,9 @@ pub const NileCompositor = struct {
                 self.toggleFocusedWindowFloating();
                 return;
             }
+            log.info("window keybinding: toggle fullscreen", .{});
+            self.toggleFocusedWindowFullscreen();
+            return;
         }
         const num: u64 = switch (binding.keysym) {
             xkb.Keysym.@"1" => 1,
@@ -813,6 +823,42 @@ pub const NileCompositor = struct {
         self.raiseFloatingWindows();
         Nile.dirtyWindowing();
         Nile.dirtyRendering();
+    }
+
+    fn resolveFullscreenTarget(self: *NileCompositor, seat: *@import("Seat.zig")) ?*Window {
+        _ = self;
+        switch (seat.focused) {
+            .window => |w| return w,
+            else => {
+                // Shell (or nothing) holds focus — e.g. MOD-tap detour:
+                // act on the pre-detour window at once. Fullscreen applies
+                // instantly, so unlike floating no MOD-release deferral.
+                switch (seat.shell_mod.prev) {
+                    .window => |ref| if (ref.get()) |prev_win| return prev_win,
+                    else => {},
+                }
+                return null;
+            },
+        }
+    }
+
+    fn toggleFocusedWindowFullscreen(self: *NileCompositor) void {
+        const seat = Nile.Seat.default();
+        const win = self.resolveFullscreenTarget(seat) orelse {
+            log.info("toggle fullscreen: no target window", .{});
+            return;
+        };
+        if (win.wm_requested.fullscreen != null) {
+            log.info("window {?s} leaving fullscreen", .{win.getTitle()});
+            self.exitFullscreen(win);
+        } else {
+            const out = Nile.Output.primary() orelse {
+                log.warn("toggle fullscreen: no output", .{});
+                return;
+            };
+            log.info("window {?s} entering fullscreen", .{win.getTitle()});
+            self.enterFullscreen(win, out);
+        }
     }
 
     fn ensureFloatingPosition(self: *NileCompositor, win: *Window) void {
@@ -1495,8 +1541,72 @@ pub const NileCompositor = struct {
     }
 
     fn onFullscreen(self: *NileCompositor, win: *Window, output: ?*Output) void {
-        _ = self;
-        Nile.Window.setFullscreen(win, output);
+        // Null output unambiguously means exit (client enter requests
+        // resolve to a concrete output before notifying; see
+        // XdgToplevel/XwaylandWindow handlers).
+        if (output) |out| {
+            self.enterFullscreen(win, out);
+        } else {
+            self.exitFullscreen(win);
+        }
+    }
+
+    /// Enter fullscreen on `out`: the window leaves its tiling tree (when
+    /// tiled) and renders above everything else at the full output size.
+    /// Floating windows take the same path minus the tree surgery — one
+    /// code path for both modes. The window only shows while its workspace
+    /// is current; switching back to its desktop presents it fullscreen
+    /// immediately.
+    fn enterFullscreen(self: *NileCompositor, win: *Window, out: *Output) void {
+        if (win.wm_requested.fullscreen != null) return;
+        // Pop tiled windows out of the tiling tree so the remaining tiles
+        // close the gap instead of laying out behind the fullscreen overlay.
+        const root = self.rootFor(win.wm_requested.workspace);
+        if (root.*) |*r| {
+            if (r.find(win)) |n| {
+                if (r.* == .leaf) {
+                    root.* = null;
+                } else if (r.findParent(n)) |p| {
+                    p.pop(p.branch.first == n);
+                    if (root == self.cur()) self.layoutTree(r);
+                }
+            }
+        }
+        Nile.Window.setFullscreen(win, out);
+        Nile.Window.setInformFullscreen(win, true);
+        Nile.Window.raiseToTop(win);
+        self.raiseFloatingWindows();
+        Nile.dirtyWindowing();
+        Nile.dirtyRendering();
+    }
+
+    /// Leave fullscreen: rejoin the tiling tree when the workspace tiles
+    /// and the window is not forced-floating, otherwise stay floating.
+    fn exitFullscreen(self: *NileCompositor, win: *Window) void {
+        if (win.wm_requested.fullscreen == null) return;
+        Nile.Window.setFullscreen(win, null);
+        Nile.Window.setInformFullscreen(win, false);
+        const ws_mode = server.workspace.getEffectiveMode(win.wm_requested.workspace);
+        if (ws_mode == .tiling and !win.floating) {
+            const root = self.rootFor(win.wm_requested.workspace);
+            var in_tree = false;
+            if (root.*) |*r| {
+                if (r.find(win) != null) in_tree = true;
+            }
+            if (!in_tree) {
+                if (root.*) |*r| {
+                    const drop_x: i32 = @intCast(@max(0, win.box.x));
+                    const drop_y: i32 = @intCast(@max(0, win.box.y));
+                    r.append(self.gpa, win, drop_x, drop_y);
+                } else {
+                    root.* = .{ .leaf = win };
+                }
+            }
+            if (root == self.cur()) self.layoutCurrent();
+        }
+        self.raiseFloatingWindows();
+        Nile.dirtyWindowing();
+        Nile.dirtyRendering();
     }
 
     fn onMaximize(self: *NileCompositor, win: *Window, maximize: bool) void {

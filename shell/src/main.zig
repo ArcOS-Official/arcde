@@ -4,6 +4,7 @@ const ls = @import("layershell");
 const State = @import("State.zig");
 const HubUi = @import("HubUi.zig");
 const Icons = @import("Icons.zig");
+const event_pump = @import("event_pump.zig");
 
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
@@ -24,32 +25,9 @@ fn requestDvuiRefresh(ctx: ?*anyopaque) void {
     }
 }
 
-// Single shared pump for both layer-shell windows. SDL owns one process-wide
-// event queue, so one pump must serve all windows: dispatch by target window.
-// App-level quit has no target: mirror it to both windows so they share one
-// lifetime (otherwise only the bar would close and the hub surface would
-// linger with its last frame). Other target-less events (e.g. the refresh
-// wakeup) go to the bar, matching the backend's "global events are managed
-// by the primary window" convention.
+// Single shared pump for both layer-shell windows; see event_pump.zig.
 fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_hub: anytype) !void {
-    // Backends arrive as pointers; decl access needs the struct type.
-    const C = @TypeOf(backend_bar.*).c;
-    var ev: C.SDL_Event = undefined;
-    while (C.SDL_PollEvent(&ev)) {
-        if (ev.type == C.SDL_EVENT_QUIT) {
-            _ = try backend_bar.addEvent(win_bar, ev);
-            _ = try backend_hub.addEvent(win_hub, ev);
-            continue;
-        }
-        const t_ = C.SDL_GetWindowFromEvent(&ev);
-        if (t_ == null or t_ == backend_bar.window) {
-            _ = try backend_bar.addEvent(win_bar, ev);
-        } else if (t_ == backend_hub.window) {
-            _ = try backend_hub.addEvent(win_hub, ev);
-        } else {
-            _ = try backend_bar.addEvent(win_bar, ev);
-        }
-    }
+    return event_pump.pumpEvents(backend_bar, win_bar, backend_hub, win_hub);
 }
 
 // Authoritative hub keyboard (input) focus now comes from the compositor:
@@ -86,7 +64,7 @@ pub fn main(init: std.process.Init) !u8 {
         .padding = .{ 4, 6, 6, 8 },
         .layer = .top,
         .exclusive_zone = 50,
-        .namespace = "nshell",
+        .namespace = State.bar_namespace,
     }, gpa);
     var backend_bar = ctx_bar.backend;
     defer backend_bar.deinit();

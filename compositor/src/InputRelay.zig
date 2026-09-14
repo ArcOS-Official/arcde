@@ -27,11 +27,11 @@ text_inputs: wl.list.Head(TextInput, .link),
 /// The input method currently in use for this seat.
 /// Only one input method per seat may be used at a time and if one is
 /// already in use new input methods are ignored.
-/// If this is null, no text input enter events will be sent.
 input_method: ?*wlr.InputMethodV2 = null,
 input_popups: wl.list.Head(InputPopup, .link),
 /// The currently enabled text input for the currently focused surface.
-/// Always null if there is no input method.
+/// May be non-null even when there is no input method; in that case commits
+/// are simply tracked and no state is forwarded anywhere.
 text_input: ?*TextInput = null,
 
 input_method_commit: wl.Listener(void) = .init(handleInputMethodCommit),
@@ -81,8 +81,24 @@ pub fn newInputMethod(relay: *InputRelay, input_method: *wlr.InputMethodV2) void
         }
     }
 
+    // Text-input enter events are sent on keyboard focus changes and for
+    // newly created text inputs (see TextInput.create), independent of
+    // whether an input method exists. So at this point matching clients may
+    // already have focus and may even have an enabled text input tracked in
+    // relay.text_input. Only fill the gaps: enter anyone missing focus, then
+    // activate the already-enabled input if there is one.
     if (seat.focused.surface()) |surface| {
-        relay.focus(surface);
+        var it = relay.text_inputs.iterator(.forward);
+        while (it.next()) |text_input| {
+            if (text_input.wlr_text_input.focused_surface != null) continue;
+            if (text_input.wlr_text_input.resource.getClient() == surface.resource.getClient()) {
+                text_input.wlr_text_input.sendEnter(surface);
+            }
+        }
+        if (relay.text_input) |_| {
+            input_method.sendActivate();
+            relay.sendInputMethodState();
+        }
     }
 }
 
@@ -126,9 +142,12 @@ fn handleInputMethodDestroy(listener: *wl.Listener(void)) void {
     relay.input_method_new_popup.link.remove();
     relay.input_method = null;
 
-    relay.focus(null);
-
-    assert(relay.text_input == null);
+    // Text-input focus follows keyboard focus, not input-method lifetime,
+    // so keep focused_surface/enter state and any enabled text input intact.
+    // Just hide input-method popups; they belong to the dead client and will
+    // be destroyed through their own listeners anyway.
+    var it = relay.input_popups.iterator(.forward);
+    while (it.next()) |popup| popup.update();
 }
 
 fn handleInputMethodGrabKeyboard(
@@ -216,33 +235,40 @@ pub fn sendInputMethodState(relay: *InputRelay) void {
 }
 
 pub fn focus(relay: *InputRelay, new_focus: ?*wlr.Surface) void {
-    // Send leave events
+    // Send leave events. Skip inputs already focused on the new surface so
+    // this stays idempotent (newInputMethod also ensures enter state).
     {
         var it = relay.text_inputs.iterator(.forward);
         while (it.next()) |text_input| {
             if (text_input.wlr_text_input.focused_surface) |surface| {
-                // This function should not be called unless focus changes
-                assert(surface != new_focus);
+                if (surface == new_focus) continue;
                 text_input.wlr_text_input.sendLeave();
             }
         }
     }
 
-    // Clear currently enabled text input
-    if (relay.text_input != null) {
-        relay.disableTextInput();
+    // Clear currently enabled text input, but keep it if its client still
+    // owns the new focus: an enable that raced ahead of the enter event
+    // (Chromium does this) must survive the focus change.
+    if (relay.text_input) |text_input| {
+        const keep = if (new_focus) |surface| blk: {
+            if (text_input.wlr_text_input.focused_surface == surface) break :blk true;
+            // Early enable arrived before enter was sent.
+            break :blk text_input.wlr_text_input.resource.getClient() == surface.resource.getClient();
+        } else false;
+        if (!keep) relay.disableTextInput();
     }
 
-    // Send enter events if we have an input method.
-    // No text input for the new surface should be enabled yet as the client
-    // should wait until it receives an enter event.
+    // Send enter events following keyboard focus, independent of whether an
+    // input method is bound. No text input for the new surface should be
+    // enabled yet as well-behaved clients wait for enter, but buggy ones may
+    // have enabled early -- handled above.
     if (new_focus) |surface| {
-        if (relay.input_method != null) {
-            var it = relay.text_inputs.iterator(.forward);
-            while (it.next()) |text_input| {
-                if (text_input.wlr_text_input.resource.getClient() == surface.resource.getClient()) {
-                    text_input.wlr_text_input.sendEnter(surface);
-                }
+        var it = relay.text_inputs.iterator(.forward);
+        while (it.next()) |text_input| {
+            if (text_input.wlr_text_input.focused_surface != null) continue;
+            if (text_input.wlr_text_input.resource.getClient() == surface.resource.getClient()) {
+                text_input.wlr_text_input.sendEnter(surface);
             }
         }
     }

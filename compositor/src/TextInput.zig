@@ -42,24 +42,44 @@ pub fn create(wlr_text_input: *wlr.TextInputV3) !void {
     wlr_text_input.events.commit.add(&text_input.commit);
     wlr_text_input.events.disable.add(&text_input.disable);
     wlr_text_input.events.destroy.add(&text_input.destroy);
+
+    // Objects created after the surface already has keyboard focus would
+    // otherwise never receive enter (focus() only runs on focus changes),
+    // so every later enable/commit would look "unfocused" to wlroots and to
+    // us. Send enter immediately when this client owns the focused surface.
+    if (seat.focused.surface()) |surface| {
+        if (wlr_text_input.resource.getClient() == surface.resource.getClient()) {
+            wlr_text_input.sendEnter(surface);
+        }
+    }
 }
 
 fn handleEnable(listener: *wl.Listener(void)) void {
     const text_input: *TextInput = @fieldParentPtr("enable", listener);
     const seat: *Seat = @ptrCast(@alignCast(text_input.wlr_text_input.seat.data));
 
-    if (text_input.wlr_text_input.focused_surface == null) {
-        log.err("client requested to enable text input without focus, ignoring request", .{});
-        return;
+    const focused = text_input.wlr_text_input.focused_surface != null;
+    if (!focused) {
+        // Some clients (e.g. Chromium) enable before processing the enter event.
+        log.debug("text input enabled without focus, tracking anyway", .{});
     }
 
-    // The same text_input object may be enabled multiple times consecutively
-    // without first disabling it. Enabling a different text input object without
-    // first disabling the current one is disallowed by the protocol however.
+    // Only one text input per seat may be enabled at a time (protocol).
     if (seat.relay.text_input) |currently_enabled| {
         if (text_input != currently_enabled) {
-            log.err("client requested to enable more than one text input on a single seat, ignoring request", .{});
-            return;
+            const old_focused = currently_enabled.wlr_text_input.focused_surface != null;
+            if (focused and !old_focused) {
+                // The tracked input went stale (e.g. its surface lost focus
+                // without a disable); hand over to the focused object so IME
+                // keeps working for the focused surface.
+                log.debug("text input enable handed over to focused object", .{});
+                seat.relay.disableTextInput();
+            } else {
+                // Keep the current one: an eager background client must not
+                // steal IME state from the focused surface.
+                log.debug("client enabled more than one text input on a single seat, ignoring request", .{});
+                return;
+            }
         }
     }
 
@@ -76,7 +96,10 @@ fn handleCommit(listener: *wl.Listener(void)) void {
     const seat: *Seat = @ptrCast(@alignCast(text_input.wlr_text_input.seat.data));
 
     if (seat.relay.text_input != text_input) {
-        log.err("inactive text input tried to commit an update, client bug?", .{});
+        // Not enabled (stale client state or race with focus change).
+        // Debug, not err: without this every keystroke in a text field with
+        // no input method running spammed the log.
+        log.debug("inactive text input commit ignored", .{});
         return;
     }
 

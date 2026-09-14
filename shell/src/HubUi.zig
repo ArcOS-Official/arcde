@@ -20,12 +20,16 @@ switcher_pending: bool = false,
 switcher_armed_ms: u64 = 0,
 selected: usize = 0,
 
-// Compositor-authoritative hub keyboard focus. Written by State's worker
+// Compositor-authoritative shell keyboard focus. Written by State's worker
 // thread when the compositor broadcasts `shell_focus_changed` (see
 // State.bindHubFocus); read by the UI thread every frame for the
 // focus-loss edge in updateSwitcher. Atomic so the cross-thread store
 // never races a frame read. `hub_prev_*` stays a plain bool: it is
 // UI-edge state, only ever touched between frames.
+//
+// Shared shell domain: the compositor reports focus on EITHER shell
+// surface (bar or hub) as focused, so bar<->hub transitions publish no
+// edge and this flag stays true across them.
 hub_keyboard_focused: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 hub_prev_keyboard_focused: bool = true,
 
@@ -575,9 +579,16 @@ pub fn pushHubSurface(self: *HubUi, t: dvui.Size, ctx_hub_g: anytype) void {
 }
 
 pub fn handleGlobalKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, shift: bool, now_ms: u64, state: *State) bool {
+    // Text-entry modes own printable keystrokes: the launcher search, the
+    // network wifi search, and the wifi password entry receive .text via
+    // the focused widget. The global single-key shortcuts must stay out:
+    // typing "p" or "/" in the wifi search/password used to yank the hub
+    // into the launcher, and Tab (dvui's next-widget bind) armed the
+    // window switcher instead of moving entry focus.
+    const in_text_entry = self.hubmode == .launcher or self.hubmode == .network;
     const is_tab_down = code == .tab and action == .down;
     if (is_tab_down) {
-        if (self.hubmode == .windows) {
+        if (self.hubmode == .windows or in_text_entry) {
             return false;
         }
         if (self.hubFocused()) {
@@ -596,7 +607,7 @@ pub fn handleGlobalKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, sh
     }
     if (action == .down) {
         if (code == .slash or code == .p) {
-            if (self.hubmode != .launcher) {
+            if (!in_text_entry) {
                 self.switchMode(.launcher, state);
                 return true;
             }
@@ -677,6 +688,18 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
     if (self.net_toggle_pending) {
         self.net_toggle_pending = false;
         self.toggleNetworkMenu(state);
+    }
+
+    // MOD-tap launcher edges from the compositor (see State). Opening
+    // requests focus via switchMode; closing dismisses to clock. A tap
+    // that opens and closes back-to-back nets out to a peek.
+    if (state.launcher_open_pending) {
+        state.launcher_open_pending = false;
+        self.switchMode(.launcher, state);
+    }
+    if (state.launcher_close_pending) {
+        state.launcher_close_pending = false;
+        if (self.hubmode != .clock) self.dismissHome(state);
     }
 
     // Media/activity-driven hub resize: when a player or an activity
@@ -1021,9 +1044,16 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                     .padding = .{ .w = 4, .h = 6, .y = 6, .x = 4 },
                 });
                 defer te.deinit();
-                if (self.launcher_need_focus and self.hubFocused()) {
+                if (self.launcher_need_focus) {
+                    // Arm dvui focus at once: the compositor's keyboard
+                    // grant for the hub surface is asynchronous, and gating
+                    // dvui focus on it leaves the entry unfocused (and the
+                    // search untypeable) until the round-trip lands — or
+                    // forever when the grant never arrives. Re-asserting
+                    // each frame is idempotent; the flag retires once OS
+                    // focus is confirmed so later user focus moves stick.
                     dvui.focusWidget(te.data().id, null, null);
-                    self.launcher_need_focus = false;
+                    if (self.hubFocused()) self.launcher_need_focus = false;
                 }
                 break :blk te.getText();
             };
@@ -1435,9 +1465,12 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                             .margin = .{ .h = 8 },
                         });
                         defer qbox.deinit();
-                        if (self.net_need_focus and self.hubFocused()) {
+                        if (self.net_need_focus) {
+                            // Same async-grant reasoning as the launcher
+                            // entry above: focus dvui at once, retire on
+                            // compositor focus.
                             dvui.focusWidget(qbox.data().id, null, null);
-                            self.net_need_focus = false;
+                            if (self.hubFocused()) self.net_need_focus = false;
                         }
                         break :blk qbox.getText();
                     };

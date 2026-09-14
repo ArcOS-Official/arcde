@@ -12,10 +12,14 @@ pub const Notif = @import("Notif.zig");
 const State = @This();
 
 // Namespace of the interactive hub layer surface (see main.zig initWindow).
-// Declared to the compositor via shell_register so it can focus this
-// surface on MOD press without nshell ever learning which key MOD is,
-// and via request_keyboard_focus so opening a menu takes focus.
+// Part of the compositor's fixed shell focus domain (bar + hub): keyboard
+// focus on either one counts as shell focus, and either surface may
+// request it via request_keyboard_focus.
 pub const shell_namespace = "nshell-hub";
+
+// Namespace of the bar layer surface (see main.zig initWindow). Same
+// shared domain as the hub: focusing one focuses the domain.
+pub const bar_namespace = "nshell";
 
 // Request/response socket served by the compositor (`Bank.socket_id = "compositor"`).
 // The same connection doubles as the push channel: the server broadcasts
@@ -52,11 +56,15 @@ pub const Action = union(enum) {
     capture_output: CaptureOutput,
     get_window: u64,
     set_window_floating: SetWindowFloating,
+    set_window_fullscreen: SetWindowFullscreen,
     set_workspace_mode: SetWorkspaceMode,
     set_focus_config: SetFocusConfig,
-    // Ask the compositor for keyboard focus on the hub layer surface
-    // (shell_namespace, filled in by the worker). No payload: plain data.
-    request_keyboard_focus: void,
+    // Ask the compositor for keyboard focus on a shell-domain surface
+    // (bar or hub). Either surface may request; the grant focuses the
+    // shared domain, so both count as focused. No heap: the worker fills
+    // in the namespace string. Plain data by design.
+    request_keyboard_focus: ShellFocusTarget,
+    pub const ShellFocusTarget = enum { hub, bar };
     pub const CaptureWindow = struct {
         id: u64,
         scale: u32,
@@ -66,6 +74,7 @@ pub const Action = union(enum) {
         scale: u32,
     };
     pub const SetWindowFloating = struct { id: u64, floating: bool };
+    pub const SetWindowFullscreen = struct { id: u64, fullscreen: bool };
     pub const SetWorkspaceMode = struct { id: u64, mode: proto.WorkspaceMode };
     pub const SetFocusConfig = struct { switch_workspace_on_focus: bool };
 
@@ -141,9 +150,11 @@ workspaces: []proto.Workspace = &.{},
 windows: []proto.Window = &.{},
 outputs: []proto.Output = &.{},
 
-// (launcher_opened/launcher_closed are compositor MOD-tap gestures for
-// the app launcher — see nile doc "Shell launcher". They are not switcher
-// state; hubFrame owns its own simple hub_* var if it needs one.)
+// MOD-tap launcher edges from the compositor (see applyEvent). Set on
+// the UI thread, consumed by HubUi.hubFrame. Plain bools: both sides
+// run on the UI thread (pushes arrive via the commit queue).
+launcher_open_pending: bool = false,
+launcher_close_pending: bool = false,
 
 // UI-thread thumbnail cache (see ImageEntry).
 images: ImageMap = undefined,
@@ -325,11 +336,22 @@ pub fn bindHubFocus(self: *State, focus: *std.atomic.Value(bool)) void {
     self.hub_focus = focus;
 }
 
-// Ask the compositor for keyboard focus on the hub layer surface (the
-// compositor grants it on request). Called when opening any menu from
-// clock mode so typing lands in the panel instead of the app beneath.
+// Ask the compositor for keyboard focus on a shell-domain surface (the
+// compositor grants it on request, focusing the shared bar+hub domain).
+// Called when opening any menu from clock mode so typing lands in the
+// panel instead of the app beneath.
+pub fn requestShellFocus(self: *State, target: Action.ShellFocusTarget) void {
+    self.req_q.push(self.alloc, self.io, .{ .request_keyboard_focus = target });
+}
+
+// Ask for keyboard focus on the hub layer surface.
 pub fn requestHubFocus(self: *State) void {
-    self.req_q.push(self.alloc, self.io, .{ .request_keyboard_focus = {} });
+    self.requestShellFocus(.hub);
+}
+
+// Ask for keyboard focus on the bar layer surface.
+pub fn requestBarFocus(self: *State) void {
+    self.requestShellFocus(.bar);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +380,29 @@ pub fn toggleFocusedWindowFloating(self: *State) void {
         if (w.focused) break w.id;
     } else self.windows[0].id;
     self.toggleWindowFloating(id);
+}
+
+/// Set a window's fullscreen flag directly. The compositor pops a tiled
+/// window out of its tiling tree while fullscreen (floating windows just
+/// raise above the rest); the window takes the whole output the moment
+/// its workspace is visible.
+pub fn setWindowFullscreen(self: *State, id: u64, fullscreen: bool) void {
+    self.req_q.push(self.alloc, self.io, .{ .set_window_fullscreen = .{ .id = id, .fullscreen = fullscreen } });
+}
+
+/// Toggle a window's fullscreen state (reads current model; falls back to true).
+pub fn toggleWindowFullscreen(self: *State, id: u64) void {
+    const cur = if (self.findWindow(id)) |w| w.fullscreen else false;
+    self.setWindowFullscreen(id, !cur);
+}
+
+/// Convenience: toggle the currently focused window fullscreen.
+pub fn toggleFocusedWindowFullscreen(self: *State) void {
+    if (self.windows.len == 0) return;
+    const id = for (self.windows) |*w| {
+        if (w.focused) break w.id;
+    } else self.windows[0].id;
+    self.toggleWindowFullscreen(id);
 }
 
 /// Set a workspace's tiling/floating mode explicitly.
@@ -895,6 +940,10 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
             var ev = try conn.requestCompositor(.{ .set_window_floating = .{ .id = v.id, .floating = v.floating } }, .raw);
             defer ev.deinit(self.alloc);
         },
+        .set_window_fullscreen => |v| {
+            var ev = try conn.requestCompositor(.{ .set_window_fullscreen = .{ .id = v.id, .fullscreen = v.fullscreen } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
         .set_workspace_mode => |v| {
             var ev = try conn.requestCompositor(.{ .set_workspace_mode = .{ .id = v.id, .mode = v.mode } }, .raw);
             defer ev.deinit(self.alloc);
@@ -903,8 +952,12 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
             var ev = try conn.requestCompositor(.{ .set_focus_config = .{ .switch_workspace_on_focus = v.switch_workspace_on_focus } }, .raw);
             defer ev.deinit(self.alloc);
         },
-        .request_keyboard_focus => {
-            var ev = try conn.requestCompositor(.{ .request_keyboard_focus = .{ .namespace = shell_namespace } }, .raw);
+        .request_keyboard_focus => |v| {
+            const ns: []const u8 = switch (v) {
+                .hub => shell_namespace,
+                .bar => bar_namespace,
+            };
+            var ev = try conn.requestCompositor(.{ .request_keyboard_focus = .{ .namespace = ns } }, .raw);
             defer ev.deinit(self.alloc);
         },
     }
@@ -1324,11 +1377,15 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
             // Unknown workspace: fetch via upsert fallback (rare).
             // Leave as-is; next full list will converge.
         },
-        // MOD-tap launcher gesture (see compositor/src/Seat.zig shellModTap):
-        // launcher_opened/launcher_closed are for the app launcher, not
-        // the window switcher. hubFrame owns its own simple hub_* var
-        // (like hub_keyboard_focused) if it wants local switcher state.
-        .launcher_opened, .launcher_closed => {},
+        // MOD-tap launcher gesture: the compositor focused the shell
+        // (opened) or moved on (closed). HubUi.hubFrame consumes these
+        // as pending flags so switchMode runs in hub window context.
+        .launcher_opened => {
+            self.launcher_open_pending = true;
+        },
+        .launcher_closed => {
+            self.launcher_close_pending = true;
+        },
         else => {},
     }
 }

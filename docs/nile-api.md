@@ -248,8 +248,9 @@ One message is pushed per state change: `new_window`, `window_closed`,
 `output_removed`, `output_changed`, `workspace_created`, `workspace_removed`,
 `workspace_activated`, `workspace_deactivated`, `switch_workspace`,
 `launcher_opened`, `launcher_closed` (mod-tap shell gesture, see below),
-`shell_focus_changed { focused }` (keyboard focus on the registered shell
-surface gained/lost; also pushed once right after every `shell_register`
+`shell_focus_changed { focused }` (keyboard focus on the shared shell
+domain — the bar or hub surface — gained/lost; bar<->hub transitions
+publish no edge. Also pushed once right after every `shell_register`
 so a (re)connected shell converges without waiting for the next edge)
 (a full `windows` list is re-pushed on focus change so shells see MRU focus
 order without re-querying; renames arrive as a full `workspaces_snapshot`).
@@ -261,13 +262,21 @@ no-ops — staying connected is the subscription mechanism.
 asynchronously on the main thread (acked with `pong`); the outcome arrives
 as a push.
 
-### Shell launcher (mod-tap)
+### Shell launcher (mod-tap) and the shell focus domain
 
-The shell declares its interactive layer surface with
-`shell_register { namespace }` (acked with `pong`; re-send on every
-reconnect, last writer wins). Holding the MOD key (Alt when nested,
+The shell UI is a fixed focus domain: the bar (`nshell`) and hub overlay
+(`nshell-hub`) layer surfaces. Keyboard focus on either one counts as
+shell focus (shared domain: focusing one focuses the domain), and the
+shell declares itself with `shell_register { namespace }` (acked with
+`pong` for a domain namespace, rejected otherwise; re-send on every
+reconnect). Registration converges focus state only — namespaces are not
+transferable, so no client can hijack them.
+`request_keyboard_focus { namespace }` (empty = topmost domain surface)
+focuses shell UI from either shell surface; namespaces outside the
+domain are rejected, never retargeted at other windows.
+Holding the MOD key (Alt when nested,
 Super/Logo on DRM/KMS — see `util.modMask`) with nothing else held focuses
-that surface and broadcasts
+a shell-domain surface and broadcasts
 `launcher_opened`, so the shell can show its launcher UI. Releasing MOD
 broadcasts `launcher_closed` and, if focus is still on the shell, restores
 whatever had focus before the hold.
@@ -279,8 +288,11 @@ MOD normally, so the shell can track MOD held state; if focus is already
 on one of those surfaces the detour leaves it alone (no refocus, no
 broadcast) and MOD is delivered straight to it.
 Key combos keep working throughout: keybindings are matched before focus
-dispatch, so MOD+key fires regardless of which surface has focus, and
-unmatched keys flow to the focused surface as usual.
+dispatch, so MOD+key fires regardless of which surface has focus.
+A Win-held chord that matches no binding is detoured to the shell domain
+like a tap (focus moves, `launcher_opened` fires); unmatched keys flow to
+the focused surface as usual, so foreign windows never observe
+Win-modified input.
 
 ### Thumbnail captures
 

@@ -335,9 +335,14 @@ fn handleRequestMaximize(listener: *wl.Listener(void)) void {
 fn handleRequestFullscreen(listener: *wl.Listener(void)) void {
     const xwindow: *XwaylandWindow = @fieldParentPtr("request_fullscreen", listener);
     if (xwindow.xsurface.fullscreen) {
-        xwindow.window.wm_scheduled.fullscreen_requested = .{ .fullscreen = null };
+        // Enter on the primary output (X11 has no output hint). A null
+        // output in the event unambiguously means exit (see NileCompositor).
+        const output = @import("Nile.zig").Output.primary();
+        xwindow.window.wm_scheduled.fullscreen_requested = .{ .fullscreen = output };
+        @import("Compositor.zig").notify(.{ .window_fullscreen_request = .{ .window = xwindow.window, .output = output } });
     } else {
         xwindow.window.wm_scheduled.fullscreen_requested = .exit;
+        @import("Compositor.zig").notify(.{ .window_fullscreen_request = .{ .window = xwindow.window, .output = null } });
     }
     server.wm.dirtyWindowing();
 }

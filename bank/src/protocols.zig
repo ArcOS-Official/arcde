@@ -598,6 +598,7 @@ pub const compositor = struct {
         set_focus_config = 0x49,
         request_keyboard_focus = 0x4A,
         release_keyboard_focus = 0x4B,
+        set_window_fullscreen = 0x4C,
     };
 
     pub const Request = union(RequestTag) {
@@ -628,6 +629,7 @@ pub const compositor = struct {
         set_focus_config: SetFocusConfig,
         request_keyboard_focus: RequestKeyboardFocus,
         release_keyboard_focus: void,
+        set_window_fullscreen: SetWindowFullscreen,
 
         // payload structs
         pub const WindowImageReq = struct {
@@ -660,6 +662,7 @@ pub const compositor = struct {
         pub const SetWorkspaceMode = struct { id: u64, mode: WorkspaceMode };
         pub const SetFocusConfig = struct { switch_workspace_on_focus: bool };
         pub const RequestKeyboardFocus = struct { namespace: []const u8 };
+        pub const SetWindowFullscreen = struct { id: u64, fullscreen: bool };
 
         pub fn deinit(self: Request, alloc: Allocator) void {
             switch (self) {
@@ -728,6 +731,10 @@ pub const compositor = struct {
                     try wire.writeString(&list, alloc, v.namespace);
                 },
                 .release_keyboard_focus => {},
+                .set_window_fullscreen => |v| {
+                    try wire.writeU64BE(&list, alloc, v.id);
+                    try wire.writeBool(&list, alloc, v.fullscreen);
+                },
             }
             return list.toOwnedSlice(alloc);
         }
@@ -886,6 +893,12 @@ pub const compositor = struct {
                 .release_keyboard_focus => {
                     if (!r.eof()) return error.InvalidData;
                     return .{ .release_keyboard_focus = {} };
+                },
+                .set_window_fullscreen => {
+                    const id = try r.readU64BE();
+                    const fullscreen = try r.readBool();
+                    if (!r.eof()) return error.InvalidData;
+                    return .{ .set_window_fullscreen = .{ .id = id, .fullscreen = fullscreen } };
                 },
             }
         }
@@ -1662,6 +1675,8 @@ test "compositor Request encode/decode raw" {
         .{ .move_window = .{ .id = 1, .x = -10, .y = 20 } },
         .{ .set_workspace_name = .{ .id = 7, .name = "code" } },
         .{ .shell_register = .{ .namespace = "nshell-hub" } },
+        .{ .set_window_fullscreen = .{ .id = 99, .fullscreen = true } },
+        .{ .set_window_fullscreen = .{ .id = 99, .fullscreen = false } },
     };
     for (cases) |req| {
         const k = req.kind();
@@ -1678,6 +1693,12 @@ test "compositor Request encode/decode raw" {
                 }
             },
             .shell_register => |v| try t.expectEqualStrings("nshell-hub", v.namespace),
+            .set_window_fullscreen => |v| {
+                try t.expectEqual(@as(u64, 99), v.id);
+                if (k == @intFromEnum(compositor.RequestTag.set_window_fullscreen)) {
+                    try t.expectEqual(req.set_window_fullscreen.fullscreen, v.fullscreen);
+                }
+            },
             else => {},
         }
     }

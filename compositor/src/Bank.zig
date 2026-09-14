@@ -20,6 +20,7 @@ const protocols = nilebank.protocols.compositor;
 
 const server = &@import("main.zig").server;
 const util = @import("util.zig");
+const ShellDomain = @import("shell_domain");
 const Window = @import("Window.zig");
 const Output = @import("Output.zig");
 const Compositor = @import("Compositor.zig");
@@ -727,35 +728,22 @@ fn focusOrderPrune() void {
 }
 
 // ---------------------------------------------------------------------------
-// Shell registry — which layer surface is the interactive shell (launcher).
+// Shell focus domain — the bar + hub overlay, by namespace.
 //
-// The shell declares itself with `shell_register { namespace }` (last writer
-// wins; there is normally one shell). Mod-tap handling resolves the topmost
-// mapped surface with that namespace in the overlay/top layers and focuses
-// it. Written from the bank IO thread, read from the Wayland main thread.
+// There is no dynamic registry: the domain is fixed (see
+// ShellDomain.namespaces), so no client can hijack it. `shell_register`
+// only converges a (re)connected shell onto the current focus state.
+// Keyboard focus on ANY domain surface counts as shell focus (shared
+// domain: focusing one focuses the domain), Win-modified input is
+// directed here, and `request_keyboard_focus` may only target these.
+// Written nowhere at runtime; read from both the bank IO thread (never —
+// lookups run on the main thread only) and the Wayland main thread.
 // ---------------------------------------------------------------------------
 
-var shell_namespace: ?[]u8 = null;
-var shell_mu: Io.Mutex = .init;
-
-/// Take ownership of an already-duped namespace, freeing the previous one.
-pub fn registerShell(namespace: []u8) void {
-    shell_mu.lockUncancelable(ioForRequestThread());
-    defer shell_mu.unlock(ioForRequestThread());
-    if (shell_namespace) |old| bank_alloc.free(old);
-    shell_namespace = namespace;
-}
-
-/// Topmost mapped layer surface in overlay/top layers whose namespace
-/// matches the registered shell, if any. Main thread only: the returned
-/// pointer is used immediately, so no client commit/destroy can interleave.
+/// Topmost mapped shell-domain surface in overlay/top layers, if any. Main
+/// thread only: the returned pointer is used immediately, so no client
+/// commit/destroy can interleave.
 pub fn findShellSurface() ?*LayerSurface {
-    shell_mu.lockUncancelable(ioForMainThread());
-    const ns = shell_namespace orelse {
-        shell_mu.unlock(ioForMainThread());
-        return null;
-    };
-    defer shell_mu.unlock(ioForMainThread());
     for ([_]zwlr.LayerShellV1.Layer{ .overlay, .top }) |layer| {
         const tree = server.scene.layerSurfaceTree(layer);
         var it = tree.children.iterator(.reverse);
@@ -768,10 +756,37 @@ pub fn findShellSurface() ?*LayerSurface {
             };
             const wlr_layer_surface = layer_surface.wlr_layer_surface;
             if (!wlr_layer_surface.surface.mapped) continue;
-            if (std.mem.eql(u8, std.mem.span(wlr_layer_surface.namespace), ns)) return layer_surface;
+            if (ShellDomain.isShellNamespace(std.mem.span(wlr_layer_surface.namespace))) return layer_surface;
         }
     }
     return null;
+}
+
+/// True if the given layer surface belongs to the shell domain.
+pub fn isShellDomainSurface(layer_surface: *LayerSurface) bool {
+    return ShellDomain.isShellNamespace(std.mem.span(layer_surface.wlr_layer_surface.namespace));
+}
+
+/// True if the given Wayland surface is a shell-domain layer surface (bar
+/// or hub). Membership, not topmost identity: focusing either one focuses
+/// the shared domain.
+pub fn surfaceInShellDomain(surface: *wlr.Surface) bool {
+    for ([_]zwlr.LayerShellV1.Layer{ .overlay, .top }) |layer| {
+        const tree = server.scene.layerSurfaceTree(layer);
+        var it = tree.children.iterator(.reverse);
+        while (it.next()) |node| {
+            if (node.type != .tree) continue;
+            const node_data: *SceneNodeData = @ptrCast(@alignCast(node.data orelse continue));
+            const layer_surface = switch (node_data.data) {
+                .layer_surface => |ls| ls,
+                else => continue,
+            };
+            if (layer_surface.wlr_layer_surface.surface == surface) {
+                return isShellDomainSurface(layer_surface);
+            }
+        }
+    }
+    return false;
 }
 
 /// Collect all known windows in focus order: currently focused first, then
@@ -898,6 +913,7 @@ const AsyncOp = union(enum) {
     // `name` is heap-owned; freed on the main thread after applying.
     set_workspace_name: struct { id: u64, name: []u8 },
     set_window_floating: struct { id: u64, floating: bool },
+    set_window_fullscreen: struct { id: u64, fullscreen: bool },
     set_workspace_mode: struct { id: u64, mode: protocols.WorkspaceMode },
     set_focus_config: struct { switch_workspace_on_focus: bool },
     request_keyboard_focus: struct { namespace: []u8 },
@@ -1093,6 +1109,25 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                     log.warn("bank: set window {d} floating: unknown id", .{v.id});
                 }
             },
+            .set_window_fullscreen => |v| {
+                if (windowFromId(v.id)) |win| {
+                    // Route through the policy event so tiling pop-out,
+                    // layout and shell broadcasts stay in one place
+                    // (NileCompositor.onFullscreen). Enter targets the
+                    // primary output; the window takes the whole output
+                    // the moment its workspace is visible.
+                    if (v.fullscreen) {
+                        const out = @import("Nile.zig").Output.primary();
+                        @import("Compositor.zig").notify(.{ .window_fullscreen_request = .{ .window = win, .output = out } });
+                        log.info("bank: set window {d} fullscreen=true", .{v.id});
+                    } else {
+                        @import("Compositor.zig").notify(.{ .window_fullscreen_request = .{ .window = win, .output = null } });
+                        log.info("bank: set window {d} fullscreen=false", .{v.id});
+                    }
+                } else {
+                    log.warn("bank: set window {d} fullscreen: unknown id", .{v.id});
+                }
+            },
             .set_workspace_mode => |v| {
                 const mode: @import("Workspace.zig").Mode = switch (v.mode) {
                     .tiling => .tiling,
@@ -1109,6 +1144,14 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
             },
             .request_keyboard_focus => |v| {
                 defer if (v.namespace.len > 0) bank_alloc.free(v.namespace);
+                // Privilege gate: requests may only summon shell-domain UI.
+                // Foreign namespaces are rejected instead of retargeted, so
+                // no client can steal focus or direct input at app windows
+                // or foreign overlays through this path.
+                _ = ShellDomain.resolveRequestTarget(v.namespace) catch {
+                    log.warn("bank: request_keyboard_focus: rejected namespace '{s}'", .{v.namespace});
+                    return 0;
+                };
                 const target = if (v.namespace.len == 0) findShellSurface() else findLayerSurfaceByNamespace(v.namespace);
                 if (target == null) {
                     log.warn("bank: request_keyboard_focus: no surface for namespace '{s}'", .{v.namespace});
@@ -1405,19 +1448,15 @@ fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message
             break :blk .{ .pong = .{ .nonce = v.id } };
         },
         .shell_register => |v| blk: {
-            // The shell declares its interactive layer surface by namespace
-            // (normally "nshell-hub"). Stored globally, last writer wins;
-            // mod-tap handling resolves it to the topmost mapped surface.
-            // Duplicated because `req` (and its strings) is freed when this
-            // callback returns, while the registry outlives it.
-            const owned = alloc.dupe(u8, v.namespace) catch break :blk .{
-                .error_msg = .{ .code = 1, .message = try alloc.dupe(u8, "out of memory") },
+            // The shell domain is fixed (see ShellDomain.namespaces), so
+            // registration only converges a (re)connected shell onto the
+            // current focus state. Anything outside the domain is rejected:
+            // namespaces are not transferable, so no client can hijack
+            // MOD-tap, Win-chord detours, or focus requests by registering.
+            if (!ShellDomain.isShellNamespace(v.namespace)) break :blk .{
+                .error_msg = .{ .code = 1, .message = try alloc.dupe(u8, "unknown shell namespace") },
             };
-            if (owned.len == 0) break :blk .{
-                .error_msg = .{ .code = 1, .message = try alloc.dupe(u8, "empty namespace") },
-            };
-            registerShell(owned);
-            log.info("bank: shell registered as '{s}'", .{owned});
+            log.info("bank: shell surface registered '{s}'", .{v.namespace});
             // Pushes only fire on edges: converge the (re)connected shell
             // on the current focus state from the main thread.
             queueAsync(.refresh_shell_focus);
@@ -1425,6 +1464,10 @@ fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message
         },
         .set_window_floating => |v| blk: {
             queueAsync(.{ .set_window_floating = .{ .id = v.id, .floating = v.floating } });
+            break :blk .{ .pong = .{ .nonce = v.id } };
+        },
+        .set_window_fullscreen => |v| blk: {
+            queueAsync(.{ .set_window_fullscreen = .{ .id = v.id, .fullscreen = v.fullscreen } });
             break :blk .{ .pong = .{ .nonce = v.id } };
         },
         .set_workspace_mode => |v| blk: {
@@ -1778,10 +1821,6 @@ pub fn deinit() void {
         t.deinit();
         bank_alloc.destroy(t);
         bank_threaded = null;
-    }
-    if (shell_namespace) |ns| {
-        bank_alloc.free(ns);
-        shell_namespace = null;
     }
     // After the IO threads are gone: no in-flight capture serve can touch
     // the maps anymore, so it is safe to free them here on the main thread.

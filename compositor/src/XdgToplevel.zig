@@ -412,8 +412,11 @@ fn handleRequestFullscreen(listener: *wl.Listener(void)) void {
             toplevel.window.wm_scheduled.fullscreen_requested = .{ .fullscreen = output };
             @import("Compositor.zig").notify(.{ .window_fullscreen_request = .{ .window = toplevel.window, .output = output } });
         } else {
-            toplevel.window.wm_scheduled.fullscreen_requested = .{ .fullscreen = null };
-            @import("Compositor.zig").notify(.{ .window_fullscreen_request = .{ .window = toplevel.window, .output = null } });
+            // No output hint: enter on the primary output. A null output
+            // in the event unambiguously means exit (see NileCompositor).
+            const output = @import("Nile.zig").Output.primary();
+            toplevel.window.wm_scheduled.fullscreen_requested = .{ .fullscreen = output };
+            @import("Compositor.zig").notify(.{ .window_fullscreen_request = .{ .window = toplevel.window, .output = output } });
         }
     } else {
         toplevel.window.wm_scheduled.fullscreen_requested = .exit;

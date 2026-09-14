@@ -716,6 +716,49 @@ test "hub_ui: entering clock pushes focus to head window" {
     try testing.expectEqual(@as(usize, 1), focus_actions);
 }
 
+test "hub_ui: global shortcuts yield to text entries" {
+    // The launcher search, the wifi search, and the wifi password entry
+    // own printable keystrokes. Single-key shortcuts must not fire while
+    // those panels are open: typing "p" or "/" in the network panel used
+    // to yank the hub into the launcher, and Tab armed the switcher
+    // instead of moving entry focus (dvui's next-widget bind).
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+    try addWindows(&state, 1);
+
+    var h = HubUi.init();
+
+    h.switchMode(.network, &state);
+    try testing.expect(!h.handleGlobalKey(.p, .down, false, 1000, &state));
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
+    try testing.expect(!h.handleGlobalKey(.slash, .down, false, 1000, &state));
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
+    try testing.expect(!h.handleGlobalKey(.tab, .down, false, 1000, &state));
+    try testing.expect(!h.switcher_pending);
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
+
+    h.switchMode(.launcher, &state);
+    try testing.expect(!h.handleGlobalKey(.p, .down, false, 1000, &state));
+    try testing.expectEqual(HubUi.HubMode.launcher, h.hubmode);
+    try testing.expect(!h.handleGlobalKey(.slash, .down, false, 1000, &state));
+    try testing.expectEqual(HubUi.HubMode.launcher, h.hubmode);
+    try testing.expect(!h.handleGlobalKey(.tab, .down, false, 1000, &state));
+    try testing.expect(!h.switcher_pending);
+
+    // From clock the shortcuts still fire.
+    h.switchMode(.clock, &state);
+    try testing.expect(h.handleGlobalKey(.p, .down, false, 1000, &state));
+    try testing.expectEqual(HubUi.HubMode.launcher, h.hubmode);
+    h.switchMode(.clock, &state);
+    try testing.expect(h.handleGlobalKey(.slash, .down, false, 1000, &state));
+    try testing.expectEqual(HubUi.HubMode.launcher, h.hubmode);
+}
+
 test "hub_ui: clock entry pushes no focus when unfocused or empty" {
     const alloc = testing.allocator;
     const io = testing.io;

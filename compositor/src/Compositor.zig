@@ -83,7 +83,10 @@ pub const Event = union(enum) {
     /// Parent window changed (transient).
     window_parent_changed: *Window,
 
-    /// Client requested fullscreen. `output` may be null (client didn't hint).
+    /// Client requested fullscreen enter/exit, or a programmatic set (e.g.
+    /// shell IPC `set_window_fullscreen`). A null `output` unambiguously
+    /// means exit: enter requests always resolve to a concrete output
+    /// (client hint or primary fallback) before notifying.
     window_fullscreen_request: struct {
         window: *Window,
         output: ?*Output,

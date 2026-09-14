@@ -372,6 +372,14 @@ fn handleKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboa
         if (group.getInputMethodGrab() != null) {
             break :blk .im_grab;
         }
+        // Win-held chords that match no WM binding belong to the shell
+        // domain: detour focus there so foreign windows never observe
+        // Win-modified input. (A lone MOD press is swallowed above;
+        // bindings and input-method grabs win over this detour, and a
+        // failed detour — locked, shell gone — falls through to focus.)
+        if (if (util.modIsAlt()) modifiers.alt else modifiers.logo) {
+            _ = group.seat.shellChordDetour();
+        }
         break :blk .focus;
     };
 

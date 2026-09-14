@@ -253,7 +253,7 @@ keyboard_groups: wl.list.Head(KeyboardGroup, .link),
 focused: Focus = .none,
 
 /// Mod-tap shell launcher state. Holding the MOD key (Alt when nested,
-/// Super otherwise — see `util.modMask`) focuses the registered shell layer surface; releasing MOD
+/// Super otherwise — see `util.modMask`) focuses a shell-domain surface; releasing MOD
 /// restores the previous focus, but only if the shell focus was gained by
 /// that hold and focus hasn't moved on since. The MOD key itself is swallowed
 /// (`KeyboardGroup.KeyConsumer.mod_tap`) unless keyboard focus is on a
@@ -699,20 +699,24 @@ pub fn shellModSym(sym: xkb.Keysym) bool {
     return sym == xkb.Keysym.Super_L or sym == xkb.Keysym.Super_R;
 }
 
-/// True if the given surface is the registered shell launcher surface.
+/// True if the given surface is shell UI: any mapped shell-domain layer
+/// surface (bar or hub), not just the topmost one. Membership is what
+/// makes focus shared — focusing either one focuses the domain.
 pub fn isShellSurface(surface: *wlr.Surface) bool {
     const Bank = @import("Bank.zig");
-    const shell = Bank.findShellSurface() orelse return false;
-    return shell.wlr_layer_surface.surface == surface;
+    return Bank.surfaceInShellDomain(surface);
 }
 
-/// True if the seat's current keyboard focus is the registered shell.
+/// True if the seat's current keyboard focus is anywhere in the shell
+/// domain (bar or hub). Shared focus: one domain, two surfaces.
 pub fn isShellFocused(seat: *Seat) bool {
     if (seat.focused != .layer_surface) return false;
     return isShellSurface(seat.focused.layer_surface.wlr_layer_surface.surface);
 }
 
-/// PID of the client that owns the registered shell surface, if any.
+/// PID of the client that owns the topmost shell-domain surface, if any.
+/// Bar and hub run in one process, so this identifies the shell process
+/// for the whole domain.
 pub fn shellPid() ?i32 {
     const Bank = @import("Bank.zig");
     const shell = Bank.findShellSurface() orelse return null;
@@ -748,7 +752,7 @@ fn layerRefEql(a: LayerSurface.Ref, b: LayerSurface.Ref) bool {
     return a.key.index == b.key.index and a.key.generation == b.key.generation;
 }
 
-/// Focus the registered shell surface, remembering the previous focus the
+/// Focus a shell-domain surface, remembering the previous focus the
 /// first time (repeat calls while already detoured keep the original).
 /// Returns false when there is no shell surface to focus.
 fn shellFocusDetour(seat: *Seat) bool {
@@ -771,6 +775,21 @@ fn shellFocusDetour(seat: *Seat) bool {
     return true;
 }
 
+/// Win-chord detour for non-binding keys pressed with MOD held: focus the
+/// shell domain (remembering the previous focus once, like the MOD-tap
+/// detour) and broadcast launcher_opened so the shell shows its UI. MOD
+/// release restores via the normal mod-tap path. Already home
+/// (shell-process focus), locked, or no shell surface: no-op. Returns
+/// whether focus is (now) shell-held.
+pub fn shellChordDetour(seat: *Seat) bool {
+    const Bank = @import("Bank.zig");
+    if (server.lock_manager.state == .locked) return false;
+    if (seat.focusedIsShellProcess()) return true;
+    if (!seat.shellFocusDetour()) return false;
+    Bank.broadcast(.{ .launcher_opened = {} });
+    return true;
+}
+
 /// Mod-tap shell launcher gesture, called from the key dispatch path for
 /// MOD-key presses and releases (`other_held` = other keys already down).
 /// Pure side effect on focus/broadcasts: the MOD key itself is swallowed by
@@ -778,9 +797,9 @@ fn shellFocusDetour(seat: *Seat) bool {
 /// shell-process surface (see `focusedIsShellProcess`), which is forwarded
 /// normally.
 ///
-/// Press (MOD alone, nothing else held): focus the registered shell layer
-/// surface, remember the previous focus, broadcast `launcher_opened`.
-/// Already within the shell's own UI (hub or a same-process overlay):
+/// Press (MOD alone, nothing else held): focus a shell-domain surface,
+/// remember the previous focus, broadcast `launcher_opened`.
+/// Already within the shell's own UI (hub, bar, or a same-process overlay):
 /// leave focus alone so that surface receives MOD normally, with no
 /// detour and no broadcast.
 /// Release: broadcast `launcher_closed` and, if the shell focus is still on
@@ -815,6 +834,12 @@ pub fn shellModTap(seat: *Seat, sym: xkb.Keysym, is_press: bool, other_held: boo
             seat.focused == .layer_surface and layerRefEql(seat.focused.layer_surface.ref, r)
         else
             false;
+        // A pinned programmatic request made during this hold owns focus
+        // now, so releasing MOD restores nothing and dismisses nothing.
+        if (on_shell and Bank.isRequestKeyboardFocusPinned()) {
+            seat.shell_mod.prev = .none;
+            return;
+        }
         if (on_shell) {
             switch (seat.shell_mod.prev) {
                 .window => |ref| if (ref.get()) |win| {

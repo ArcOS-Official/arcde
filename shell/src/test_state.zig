@@ -12,6 +12,8 @@ const Ctx = struct {
     alloc: std.mem.Allocator,
     switch_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     focus_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fullscreen_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fullscreen_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     capture_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     output_capture_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     // Set when the worker declares the hub namespace after (re)connect.
@@ -69,6 +71,11 @@ fn fakeHandler(ctx: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Messag
         },
         .focus_window => |v| blk: {
             c.focus_id.store(v.id, .seq_cst);
+            break :blk .{ .pong = .{ .nonce = v.id } };
+        },
+        .set_window_fullscreen => |v| blk: {
+            c.fullscreen_id.store(v.id, .seq_cst);
+            c.fullscreen_flag.store(v.fullscreen, .seq_cst);
             break :blk .{ .pong = .{ .nonce = v.id } };
         },
         .get_window => |v| blk: {
@@ -172,10 +179,8 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
     }
     try t.expect(ctx.shell_registered.load(.seq_cst));
 
-    // Launcher pushes (compositor MOD tap) are for the app launcher,
-    // not the window switcher — State intentionally ignores them for
-    // switcher; hubFrame would own a simple local hub_* var if needed.
-    // Verify they are harmless and don't affect switcher state.
+    // Launcher pushes (compositor MOD tap) arm HubUi pending flags for
+    // hubFrame to consume — they must not disturb switcher/model state.
     {
         var ev: proto.Event = .{ .launcher_opened = {} };
         defer ev.deinit(alloc);
@@ -186,14 +191,17 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
         defer ev.deinit(alloc);
         try server.broadcastCompositorEventDefault(ev);
     }
-    // Drain them; no launcher_open field to check — just ensure update
-    // doesn't crash and model stays intact.
+    // Drain them; the model stays intact and both flags arm.
     tries = 0;
     while (tries < 20) : (tries += 1) {
         state.update();
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     try t.expectEqual(@as(usize, 1), state.windows.len);
+    try t.expect(state.launcher_open_pending);
+    try t.expect(state.launcher_close_pending);
+    state.launcher_open_pending = false;
+    state.launcher_close_pending = false;
 
     // Compositor-driven hub focus: the worker stores `shell_focus_changed`
     // pushes straight into the bound HubUi flag (no commit-queue round
@@ -347,6 +355,34 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     try t.expectEqual(@as(u64, 99), ctx.focus_id.load(.seq_cst));
+
+    // Fullscreen action reaches the server; the state broadcast merges
+    // the flag into the model; toggle flips it back.
+    state.setWindowFullscreen(100, true);
+    tries = 0;
+    while ((ctx.fullscreen_id.load(.seq_cst) != 100 or !ctx.fullscreen_flag.load(.seq_cst)) and tries < 500) : (tries += 1) {
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expectEqual(@as(u64, 100), ctx.fullscreen_id.load(.seq_cst));
+    try t.expect(ctx.fullscreen_flag.load(.seq_cst));
+    {
+        var ev: proto.Event = .{ .window_state_changed = .{ .id = 100, .floating = false, .fullscreen = true, .urgent = false, .focused = true } };
+        defer ev.deinit(alloc);
+        try server.broadcastCompositorEventDefault(ev);
+    }
+    tries = 0;
+    while (tries < 500) : (tries += 1) {
+        state.update();
+        if (state.windows.len > 0 and state.windows[0].id == 100 and state.windows[0].fullscreen) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(state.windows[0].fullscreen);
+    state.toggleWindowFullscreen(100);
+    tries = 0;
+    while (ctx.fullscreen_flag.load(.seq_cst) and tries < 500) : (tries += 1) {
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(!ctx.fullscreen_flag.load(.seq_cst));
 
     // Images: miss enqueues one capture; pixels land in the map; repeats
     // are served from cache with no new traffic.

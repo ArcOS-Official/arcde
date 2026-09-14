@@ -178,6 +178,7 @@ fn buildCompositor(b: *std.Build, opts: CompositorOptions) !void {
     const flags = b.createModule(.{ .root_source_file = b.path(src_dir ++ "common/flags.zig") });
     const slotmap = b.createModule(.{ .root_source_file = b.path(src_dir ++ "common/slotmap.zig") });
     const floating_logic = b.createModule(.{ .root_source_file = b.path(src_dir ++ "common/floating_logic.zig") });
+    const shell_domain = b.createModule(.{ .root_source_file = b.path(src_dir ++ "common/shell_domain.zig") });
 
     const translate_c: Translator = .init(b.dependency("translate_c", .{}), .{
         .name = "c",
@@ -217,6 +218,7 @@ fn buildCompositor(b: *std.Build, opts: CompositorOptions) !void {
         nile.root_module.addImport("flags", flags);
         nile.root_module.addImport("slotmap", slotmap);
         nile.root_module.addImport("floating_logic", floating_logic);
+        nile.root_module.addImport("shell_domain", shell_domain);
         nile.root_module.addImport("c", translate_c.mod);
         nile.root_module.addImport("bank", opts.bank_mod);
 
@@ -259,6 +261,20 @@ fn buildCompositor(b: *std.Build, opts: CompositorOptions) !void {
         });
         opts.test_step.dependOn(&b.addRunArtifact(floating_test).step);
         opts.check_step.dependOn(&floating_test.step);
+    }
+
+    // shell focus-domain policy tests (pure predicates, no wlroots)
+    {
+        const shell_domain_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_dir ++ "common/shell_domain.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .use_llvm = opts.use_llvm,
+        });
+        opts.test_step.dependOn(&b.addRunArtifact(shell_domain_test).step);
+        opts.check_step.dependOn(&shell_domain_test.step);
     }
 }
 
@@ -467,4 +483,31 @@ fn buildShell(b: *std.Build, opts: ShellOptions) !void {
     });
     const bench_net_step = b.step("bench-net", "Run NetworkManager/BlueZ bench (needs system bus)");
     bench_net_step.dependOn(&b.addRunArtifact(bench_net_exe).step);
+
+    // Input-funnel checks for the shell focus domain (kept per request;
+    // see shell/test/input_funnel.zig — remove, don't commit). Real dvui
+    // + SDL backend on dummy drivers, no compositor or D-Bus: fake
+    // OS-level input goes through the live pump dispatch into hubFrame
+    // and must land in the text entries.
+    const funnel_mod = b.createModule(.{
+        .root_source_file = b.path("shell/input_funnel_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    funnel_mod.addImport("dvui", dvui_dep.module("dvui_sdl3"));
+    funnel_mod.addImport("sdl-backend", dvui_dep.module("sdl3"));
+    funnel_mod.addImport("bank", opts.bank_mod);
+    funnel_mod.addImport("tabler", tabler_mod);
+    funnel_mod.addImport("sd_bus", sd_bus_mod);
+    funnel_mod.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
+    const funnel_tests = b.addTest(.{
+        .root_module = funnel_mod,
+        .use_llvm = opts.use_llvm,
+        .use_lld = opts.use_lld,
+    });
+    opts.test_step.dependOn(&b.addRunArtifact(funnel_tests).step);
+    opts.check_step.dependOn(&funnel_tests.step);
+    const funnel_step = b.step("test-input-funnel", "Run shell input-funnel checks (headless)");
+    funnel_step.dependOn(&b.addRunArtifact(funnel_tests).step);
 }

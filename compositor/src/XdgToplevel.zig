@@ -266,8 +266,19 @@ fn handleDestroy(listener: *wl.Listener(void)) void {
             window.state = .closing;
             server.wm.dirtyWindowing();
         },
-        // State must have been set to closing in Window.unmap()
-        .mapped => unreachable,
+        .mapped => {
+            // Destroy arrived without a prior unmap: the client died
+            // without destroying its wayland objects in order (crash).
+            // Panicking here would take down the compositor for a client
+            // bug; drive the normal teardown instead (see XwaylandWindow).
+            window.state = .closing;
+            @import("Compositor.zig").notify(.{ .window_unmap = window });
+            server.wm.dirtyWindowing();
+            if (window.foreign_toplevel_handle) |handle| {
+                handle.destroy();
+                window.foreign_toplevel_handle = null;
+            }
+        },
     }
 }
 

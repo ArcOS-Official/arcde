@@ -168,6 +168,25 @@ fn handleDestroy(listener: *wl.Listener(void)) void {
 
     const window = xwindow.window;
     window.impl = .destroying;
+    switch (window.state) {
+        .init, .closing => {},
+        .ready, .initialized, .mapped => {
+            // Unmap never ran: the client died without unmapping (crash),
+            // or the map/unmap listeners were already detached by
+            // dissociate. Without this the window lingers mapped in the
+            // tiling tree forever — no manage/render is ever scheduled, so
+            // destroy() never runs and the dead tile keeps its space.
+            // Mirror Window.unmap's teardown tail (no close animation or
+            // buffer save: the client is gone, removal should be instant).
+            window.state = .closing;
+            Compositor.notify(.{ .window_unmap = window });
+            server.wm.dirtyWindowing();
+            if (window.foreign_toplevel_handle) |handle| {
+                handle.destroy();
+                window.foreign_toplevel_handle = null;
+            }
+        },
+    }
 }
 
 fn handleAssociate(listener: *wl.Listener(void)) void {

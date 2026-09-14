@@ -227,27 +227,37 @@ pub const Node = union(enum) {
         return self;
     }
 
-    /// Remove all windows that don't exist in the tree
+    /// Drop leaves whose windows are no longer alive (fully destroyed
+    /// without a tile pop). `wins` is the live window set; returns true
+    /// when this whole subtree is dead and the caller should drop it.
+    /// Only compares pointers — never dereferences a leaf — so already
+    /// freed windows are safe to prune. Live windows (including closing
+    /// ones mid-animation, still in the slotmap) are always kept.
     pub fn nullify(self: *Node, wins: []const *Window) bool {
         if (wins.len == 0)
             return true;
         switch (self.*) {
             .branch => |b| {
-                const b1 = b.first.nullify(wins);
-                const b2 = b.second.nullify(wins);
-                if (!b1 and !b2)
-                    return true;
-                if (!b1) self.pop(true);
-                if (!b2) self.pop(false);
+                const first_dead = b.first.nullify(wins);
+                const second_dead = b.second.nullify(wins);
+                if (first_dead and second_dead) return true;
+                // pop(true) drops first (keeps second);
+                // pop(false) drops second (keeps first).
+                if (first_dead) {
+                    self.pop(true);
+                } else if (second_dead) {
+                    self.pop(false);
+                }
+                return false;
             },
             .leaf => |l| {
                 for (wins) |w| {
                     if (l == w)
                         return false;
                 }
+                return true;
             },
         }
-        return true;
     }
 
     /// add a new leaf to the tree
@@ -623,29 +633,37 @@ pub const NileCompositor = struct {
     }
 
     fn onWindowDestroy(self: *NileCompositor, win: *Window) void {
-        // The window knows its workspace; detach it from that tree so the
-        // other workspaces' tilings are untouched.
-        const root = self.rootFor(win.wm_requested.workspace);
-        const ws_id = win.wm_requested.workspace;
-        if (root.*) |*r| {
-            if (r.* == .leaf) {
-                if (r.leaf == win) {
-                    root.* = null;
-                    log.debug("Root deleted", .{});
+        // Detach the window from whichever tiling tree holds its tile.
+        // Every tree is scanned by pointer identity: the window's recorded
+        // workspace cannot be trusted here — manageStart resets wm_requested
+        // to .init (workspace 1) while tearing down a closing window, so by
+        // destroy time it no longer names the tree that holds the tile. A
+        // missed pop is a permanent dead tile that keeps its space.
+        const cur_id = server.workspace.currentWorkspace();
+        for (0..ws_count) |i| {
+            const ws_id: u64 = @intCast(i + 1);
+            const root = self.rootFor(ws_id);
+            if (root.*) |*r| {
+                if (r.* == .leaf) {
+                    if (r.leaf == win) {
+                        root.* = null;
+                        log.debug("Root deleted", .{});
+                        if (ws_id == cur_id) self.layoutCurrent();
+                    }
+                    continue;
                 }
-                return;
-            }
-            // Pointer identity: find node that owns `win`, no coordinates.
-            const n = r.find(win) orelse return;
-            const p = r.findParent(n) orelse return;
-            const is_first = p.branch.first == n;
-            p.pop(is_first);
-            if (root == self.cur()) {
-                const mode = server.workspace.getEffectiveMode(ws_id);
-                if (mode == .floating) {
-                    self.layoutCurrent();
-                } else {
-                    self.layoutTree(r);
+                // Pointer identity: find node that owns `win`, no coordinates.
+                const n = r.find(win) orelse continue;
+                const p = r.findParent(n) orelse continue;
+                const is_first = p.branch.first == n;
+                p.pop(is_first);
+                if (ws_id == cur_id) {
+                    const mode = server.workspace.getEffectiveMode(ws_id);
+                    if (mode == .floating) {
+                        self.layoutCurrent();
+                    } else {
+                        self.layoutTree(r);
+                    }
                 }
             }
         }
@@ -1483,6 +1501,20 @@ pub const NileCompositor = struct {
     /// Floating windows (forced or workspace mode floating) are never added to the tiling tree.
     fn ensureCurrentTree(self: *NileCompositor) void {
         const current_ws = server.workspace.currentWorkspace();
+        // Reconcile against the live set first: any leaf whose window is
+        // already gone (missed destroy path, pre-fix leak) is pruned so a
+        // dead tile can never keep its space. Runs on every arrange, so
+        // previously leaked tiles heal without a restart.
+        {
+            const root = self.cur();
+            if (root.*) |*r| {
+                var live = std.ArrayList(*Window).empty;
+                defer live.deinit(self.gpa);
+                var lit = Nile.Window.iter();
+                while (lit.next()) |win| live.append(self.gpa, win) catch unreachable;
+                if (r.nullify(live.items)) root.* = null;
+            }
+        }
         const mode = server.workspace.getEffectiveMode(current_ws);
         if (mode == .floating) return;
         const root = self.cur();

@@ -1135,9 +1135,9 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                                     .gravity_y = 0.5,
                                 });
                             } else {
-                                // Aliased fallback: chunky pixels (raster
-                                // 14, shown 28 with nearest sampling).
-                                if (Icons.iconChunkyPx(.photo, 28, .white) catch null) |crisp| {
+                                // Smooth fallback: full-size SSAA raster,
+                                // shown with linear sampling.
+                                if (Icons.iconPx(.photo, 28, .white) catch null) |crisp| {
                                     _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
                                         .expand = .none,
                                         .min_size_content = .{ .w = 28, .h = 28 },
@@ -1573,7 +1573,7 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                                 defer row1.deinit();
                                 // One comptime call per icon (tabler embeds only
                                 // referenced icons). Aliased 1-bit raster, shown 1:1.
-                                const sig_crisp: ?Icons.Crisp = switch (State.Net.barsForStrength(conn.strength)) {
+                                const sig_crisp: ?Icons.Icon = switch (State.Net.barsForStrength(conn.strength)) {
                                     0 => Icons.iconPx(.wifi_off, 24, .white) catch null,
                                     1 => Icons.iconPx(.wifi_0, 24, .white) catch null,
                                     2 => Icons.iconPx(.wifi_1, 24, .white) catch null,
@@ -2171,7 +2171,7 @@ fn activitySection(self: *HubUi, state: *State, t: *dvui.Theme) void {
             .mic, .camera => dvui.Color.blue,
             .download => t.color(.content, .text).lighten(-10),
         };
-        const crisp: ?Icons.Crisp = switch (it.kind) {
+        const crisp: ?Icons.Icon = switch (it.kind) {
             .record => Icons.iconPx(.player_record, 20, tint) catch null,
             .share => Icons.iconPx(.screen_share, 20, tint) catch null,
             .camera => Icons.iconPx(.camera, 20, tint) catch null,
@@ -2341,7 +2341,7 @@ fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
         const tint = base.lighten(amt);
         var j: usize = 0;
         while (j < n_kind) : (j += 1) {
-            const crisp: ?Icons.Crisp = switch (ki) {
+            const crisp: ?Icons.Icon = switch (ki) {
                 0 => Icons.iconPx(.player_record, glyph_px, tint) catch null,
                 1 => Icons.iconPx(.screen_share, glyph_px, tint) catch null,
                 2 => Icons.iconPx(.camera, glyph_px, tint) catch null,

@@ -320,8 +320,8 @@ fn frame() !dvui.App.Result {
         const small = t.font_body.withSize(10.0);
         // One comptime call per icon (not a runtime-selected enum): tabler
         // embeds only referenced icons, so the selection stays explicit.
-        // Aliased 1-bit raster (see Icons): rasterize at the display size,
-        // show 1:1 with nearest sampling.
+        // Smoothed SSAA raster (see Icons): rasterize at the display size,
+        // show with linear sampling.
 
         // Bluetooth: hidden without an adapter, dimmed when off.
         if (nst.bt_present) {
@@ -340,7 +340,7 @@ fn frame() !dvui.App.Result {
         // bars otherwise — yellowed when linked but offline (same state
         // as the control-center alert). The button opens the network menu.
         const online = State.Net.online(nst.connectivity);
-        const net_crisp: ?Icons.Crisp = if (nst.eth_up)
+        const net_crisp: ?Icons.Icon = if (nst.eth_up)
             Icons.iconPx(.globe, icon_px, .white) catch null
         else if (nst.connected)
             switch (State.Net.barsForStrength(nst.strength)) {
@@ -446,7 +446,7 @@ fn frame() !dvui.App.Result {
         // under 5% reds with the need-charge icon.
         if (pst.present) {
             _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
-            const batt: ?Icons.Crisp = if (pst.charging)
+            const batt: ?Icons.Icon = if (pst.charging)
                 Icons.iconPx(.battery_charging, icon_px, dvui.Color.green) catch null
             else if (pst.percent < 5)
                 Icons.iconPx(.battery_charging_2, icon_px, dvui.Color.red) catch null

@@ -10,7 +10,7 @@ const dvui = @import("dvui");
 // `HubUi.hubFrame` (generic over `anytype`, so its widget surface is
 // never analyzed) and never call `Icons.iconPx`, so only the types and
 // signatures used by analyzed code must resolve here (`Outline` in the
-// icon helpers' signatures, `Raster` in `Crisp`-adjacent signatures).
+// icon helpers' signatures, `Raster` in `Icon`-adjacent signatures).
 // If a test ever calls the raster path, this stub returns an error and
 // callers fall back to their empty-icon path via `catch`.
 pub const Outline = enum {

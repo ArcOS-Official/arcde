@@ -1,0 +1,42 @@
+.{
+    .name = .arc,
+    .version = "0.1.0",
+    .fingerprint = 0x7fe65393e099fa77,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+    .dependencies = .{
+        // The DVUI fork: an SDL3-only build of upstream dvui at a recorded
+        // commit (see ui/FORK.md). Checked out as the ui/ submodule.
+        .dvui = .{
+            .path = "ui",
+        },
+        .dvui_layer_shell = .{
+            .url = "git+https://github.com/ArcOS-Official/dvui_layershell.git#e7786b4959d1ab8076a0c6c35830a1e19e6a362f",
+            .hash = "dvui_layer_shell-0.1.0-evhuWHj_AAAbEDorSQncjOarKOiWFVim42X0rV2ufZYx",
+        },
+        .tabler_zig = .{
+            .url = "git+https://github.com/KernelState/tabler-zig.git#b1da87bcd3cda3d6beda120f704cbdde5defec1d",
+            .hash = "tabler_zig-0.0.1-q88Ba3UWQABHwHsNnsjZ4q2_hwORdo24Yi5QfbEYpgzc",
+        },
+        .pixman = .{
+            .url = "https://codeberg.org/ifreund/zig-pixman/archive/v0.3.0.tar.gz",
+            .hash = "pixman-0.3.0-LClMnz2VAAAs7QSCGwLimV5VUYx0JFnX5xWU6HwtMuDX",
+        },
+        .wayland = .{
+            .url = "https://codeberg.org/ifreund/zig-wayland/archive/v0.6.0.tar.gz",
+            .hash = "wayland-0.6.0-lQa1kqz8AQADQmdNJsNhLoNHcnEGEUjrOaPV-dtEnEmX",
+        },
+        .wlroots = .{
+            .url = "https://codeberg.org/ifreund/zig-wlroots/archive/v0.20.1.tar.gz",
+            .hash = "wlroots-0.20.1-jmOlcqNVBAB3uB5oqBTzpRlwu-FmMyyZMVAWCe5kmcSt",
+        },
+        .xkbcommon = .{
+            .url = "https://codeberg.org/ifreund/zig-xkbcommon/archive/v0.4.0.tar.gz",
+            .hash = "xkbcommon-0.4.0-VDqIe0i2AgDRsok2GpMFYJ8SVhQS10_PI2M_CnHXsJJZ",
+        },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ifreund/translate-c?ref=0.16.x#64570104eeed461dc221e77574cd3f1c5b7eb974",
+            .hash = "translate_c-0.0.0-Q_BUWlL1BgD7PmL27vTsccyNCOvKb-B65O5Ki1ZKm-ED",
+        },
+    },
+}

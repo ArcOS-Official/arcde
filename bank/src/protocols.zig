@@ -599,6 +599,7 @@ pub const compositor = struct {
         request_keyboard_focus = 0x4A,
         release_keyboard_focus = 0x4B,
         set_window_fullscreen = 0x4C,
+        exit_session = 0x4D,
     };
 
     pub const Request = union(RequestTag) {
@@ -630,6 +631,7 @@ pub const compositor = struct {
         request_keyboard_focus: RequestKeyboardFocus,
         release_keyboard_focus: void,
         set_window_fullscreen: SetWindowFullscreen,
+        exit_session: void,
 
         // payload structs
         pub const WindowImageReq = struct {
@@ -731,6 +733,7 @@ pub const compositor = struct {
                     try wire.writeString(&list, alloc, v.namespace);
                 },
                 .release_keyboard_focus => {},
+                .exit_session => {},
                 .set_window_fullscreen => |v| {
                     try wire.writeU64BE(&list, alloc, v.id);
                     try wire.writeBool(&list, alloc, v.fullscreen);
@@ -894,6 +897,10 @@ pub const compositor = struct {
                     if (!r.eof()) return error.InvalidData;
                     return .{ .release_keyboard_focus = {} };
                 },
+                .exit_session => {
+                    if (!r.eof()) return error.InvalidData;
+                    return .{ .exit_session = {} };
+                },
                 .set_window_fullscreen => {
                     const id = try r.readU64BE();
                     const fullscreen = try r.readBool();
@@ -1022,6 +1029,7 @@ pub const compositor = struct {
         workspace_mode_changed = 0x22,
         window_floating_changed = 0x23,
         shell_focus_changed = 0x24,
+        logout_prompt = 0x25,
     };
 
     pub const Event = union(EventTag) {
@@ -1061,6 +1069,7 @@ pub const compositor = struct {
         workspace_mode_changed: WorkspaceModeChanged,
         window_floating_changed: WindowFloatingChanged,
         shell_focus_changed: ShellFocusChanged,
+        logout_prompt: void,
 
         // payload aliases for compat
         pub const NewWindow = struct {
@@ -1212,6 +1221,7 @@ pub const compositor = struct {
                 },
                 .pong => |v| try wire.writeU64BE(&list, alloc, v.nonce),
                 .launcher_opened, .launcher_closed => {},
+                .logout_prompt => {},
                 .switcher_opened, .switcher_closed => {},
                 .workspace_mode_changed => |v| {
                     try wire.writeU64BE(&list, alloc, v.id);
@@ -1458,6 +1468,10 @@ pub const compositor = struct {
                 .switcher_closed => {
                     if (!r.eof()) return error.InvalidData;
                     return .{ .switcher_closed = {} };
+                },
+                .logout_prompt => {
+                    if (!r.eof()) return error.InvalidData;
+                    return .{ .logout_prompt = {} };
                 },
                 .workspace_mode_changed => {
                     const id = try r.readU64BE();

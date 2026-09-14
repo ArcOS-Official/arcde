@@ -380,7 +380,7 @@ test "hub_ui: targetFor matches switchMode targets" {
     try testing.expectEqual(dvui.Size{ .w = 520, .h = 360 }, HubUi.targetFor(.launcher));
     try testing.expectEqual(dvui.Size{ .w = 520, .h = 420 }, HubUi.targetFor(.network));
     try testing.expectEqual(dvui.Size{ .w = 150, .h = 50 }, HubUi.targetFor(.clock));
-    try testing.expectEqual(dvui.Size{ .w = 520, .h = 412 }, HubUi.targetFor(.controls));
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 480 }, HubUi.targetFor(.controls));
 }
 
 test "hub_ui: media expands clock and control center, others override" {
@@ -391,8 +391,8 @@ test "hub_ui: media expands clock and control center, others override" {
     // Height never changes.
     try testing.expectEqual(dvui.Size{ .w = 444, .h = 50 }, HubUi.targetForMedia(.clock, true));
     // Control center always carries the attached clock header.
-    try testing.expectEqual(dvui.Size{ .w = 520, .h = 412 }, HubUi.targetForMedia(.controls, false));
-    try testing.expectEqual(dvui.Size{ .w = 520, .h = 412 }, HubUi.targetForMedia(.controls, true));
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 480 }, HubUi.targetForMedia(.controls, false));
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 480 }, HubUi.targetForMedia(.controls, true));
     // Sub-panels override entirely: no clock content there.
     try testing.expectEqual(dvui.Size{ .w = 520, .h = 420 }, HubUi.targetForMedia(.network, true));
     try testing.expectEqual(dvui.Size{ .w = 600, .h = 120 }, HubUi.targetForMedia(.windows, true));

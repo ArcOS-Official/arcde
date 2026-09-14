@@ -109,6 +109,13 @@ menu_origin: ?HubMode = null,
 // by tophubBase every frame, read by the clock branch after it.
 media_clicked: bool = false,
 
+// Power menu (control center footer, GNOME-style): `power_open` expands
+// the inline submenu (Power Off… / Restart… / Log Out…); `power_confirm`
+// shows the modal confirm dialog for the chosen action ("Are you sure
+// you want to …?" + Cancel / Confirm).
+power_open: bool = false,
+power_confirm: ?PowerConfirm = null,
+
 off_start: u64 = 0,
 
 const HubUi = @This();
@@ -126,6 +133,13 @@ pub const HubMode = enum {
 pub const NetTab = enum {
     wifi,
     bluetooth,
+};
+
+// Power-menu confirm target (see power_confirm).
+pub const PowerConfirm = enum {
+    logout,
+    poweroff,
+    restart,
 };
 
 pub const KeyAction = enum {
@@ -174,7 +188,7 @@ pub fn targetForFull(mode: HubMode, has_media: bool, n_indicators: usize) dvui.S
         .launcher => dvui.Size{ .w = 520, .h = 360 },
         .network => dvui.Size{ .w = 520, .h = 420 },
         .clock => if (has_media) dvui.Size{ .w = 444, .h = 50 } else dvui.Size{ .w = 150, .h = 50 },
-        .controls => dvui.Size{ .w = 520, .h = 412 },
+        .controls => dvui.Size{ .w = 520, .h = 480 },
         else => dvui.Size{ .w = 480, .h = 180 },
     };
     if ((mode == .clock or mode == .controls) and n_indicators > 0) {
@@ -700,6 +714,16 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
     if (state.launcher_close_pending) {
         state.launcher_close_pending = false;
         if (self.hubmode != .clock) self.dismissHome(state);
+    }
+
+    // Compositor logout confirm (first MOD+Shift+q): show the control
+    // center with "Are you sure you want to log out?" + Log Out / Cancel.
+    // Consumed here so switchMode runs in hub context like the bar toggle.
+    if (state.logout_prompt_pending) {
+        state.logout_prompt_pending = false;
+        if (self.hubmode != .controls) self.switchMode(.controls, state);
+        self.power_open = false;
+        self.power_confirm = .logout;
     }
 
     // Media/activity-driven hub resize: when a player or an activity
@@ -2028,8 +2052,9 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
             });
             defer outer_.deinit();
 
-            // Escape dismisses the control center itself straight to
-            // clock (it is a direct member, never a child).
+            // Escape dismisses an open confirm dialog first, else the
+            // control center itself straight to clock (it is a direct
+            // member, never a child).
             for (dvui.events()) |ev| {
                 if (ev.evt != .key) continue;
                 const k = ev.evt.key;
@@ -2039,7 +2064,11 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                     else => .repeat,
                 };
                 if (k.code == .escape and action == .down) {
-                    self.dismissHome(state);
+                    if (self.power_confirm != null) {
+                        self.power_confirm = null;
+                    } else {
+                        self.dismissHome(state);
+                    }
                     break;
                 }
             }
@@ -2050,6 +2079,13 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
             // the clock pill. Sub-panels (network, launcher, switcher)
             // override entirely — no clock content there.
             _ = self.tophubBase(state, t, 100);
+
+            // A confirm dialog is modal: it replaces the body below the
+            // clock header until confirmed/cancelled (GNOME-style).
+            if (self.power_confirm != null) {
+                self.powerConfirmDialog(state, t);
+                return .ok;
+            }
 
             {
                 var snap = state.net.snapshotCopy(state.alloc);
@@ -2158,11 +2194,234 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                 }
             }
             self.activitySection(state, t);
+            self.powerSection(state, t);
         },
         .search => self.switchMode(.launcher, state),
     }
 
     return .ok;
+}
+
+// Control-center power menu (GNOME-style footer): a "Power" card that
+// expands inline to Power Off… / Restart… / Log Out…. Each row arms a
+// modal confirm dialog (see powerConfirmDialog) instead of acting at
+// once — matching GNOME's `…` affordance for destructive actions.
+fn powerSection(self: *HubUi, state: *State, t: *dvui.Theme) void {
+    _ = state;
+    var card = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .horizontal,
+        .background = true,
+        .color_fill = t.color(.content, .fill).lighten(5),
+        .corners = .all(10),
+        .padding = .all(8),
+        .margin = .{ .x = 4, .y = 8, .w = 4, .h = 0 },
+    });
+    defer card.deinit();
+
+    {
+        var btn: dvui.ButtonWidget = undefined;
+        btn.init(@src(), .{ .draw_focus = false }, .{
+            .expand = .horizontal,
+            .background = false,
+        });
+        btn.processEvents();
+        defer btn.deinit();
+        if (btn.clicked()) self.power_open = !self.power_open;
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .background = false,
+            .gravity_y = 0.5,
+        });
+        defer row.deinit();
+        const glyph_px: f32 = 20;
+        if (Icons.iconPx(.power, glyph_px, t.color(.content, .text)) catch null) |ci| {
+            _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                .max_size_content = .{ .w = glyph_px, .h = glyph_px },
+            });
+        }
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        dvui.labelNoFmt(@src(), "Power", .{}, .{
+            .font = t.font_heading.withSize(10),
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+        });
+        // Icons are comptime-selected (see rows below): the open/closed
+        // chevron needs its own branch.
+        if (self.power_open) {
+            if (Icons.iconPx(.chevron_down, 16, t.color(.content, .text).lighten(-28)) catch null) |ci| {
+                _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 16, .h = 16 },
+                    .max_size_content = .{ .w = 16, .h = 16 },
+                });
+            }
+        } else {
+            if (Icons.iconPx(.chevron_right, 16, t.color(.content, .text).lighten(-28)) catch null) |ci| {
+                _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 16, .h = 16 },
+                    .max_size_content = .{ .w = 16, .h = 16 },
+                });
+            }
+        }
+    }
+
+    if (!self.power_open) return;
+
+    // Icons are comptime-selected per branch (tabler embeds only
+    // referenced icons), so each row gets its own branch instead of a
+    // runtime icon value.
+    const Row = struct {
+        confirm: PowerConfirm,
+        label: []const u8,
+    };
+    const rows = [_]Row{
+        .{ .confirm = .poweroff, .label = "Power Off…" },
+        .{ .confirm = .restart, .label = "Restart…" },
+        .{ .confirm = .logout, .label = "Log Out…" },
+    };
+    for (rows, 0..) |r, i| {
+        var btn: dvui.ButtonWidget = undefined;
+        btn.init(@src(), .{ .draw_focus = false }, .{
+            .id_extra = i,
+            .expand = .horizontal,
+            .background = true,
+            .color_fill = t.color(.content, .fill).lighten(2),
+            .color_fill_hover = t.color(.content, .fill).lighten(10),
+            .corners = .all(8),
+            .padding = .all(8),
+            .margin = .{ .y = 2 },
+        });
+        btn.processEvents();
+        btn.drawBackground();
+        defer btn.deinit();
+        if (btn.clicked()) self.power_confirm = r.confirm;
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .id_extra = i,
+            .expand = .horizontal,
+            .background = false,
+            .gravity_y = 0.5,
+        });
+        defer row.deinit();
+        const glyph_px: f32 = 18;
+        const crisp: ?Icons.Icon = switch (i) {
+            0 => Icons.iconPx(.power, glyph_px, t.color(.content, .text)) catch null,
+            1 => Icons.iconPx(.refresh, glyph_px, t.color(.content, .text)) catch null,
+            else => Icons.iconPx(.logout, glyph_px, t.color(.content, .text)) catch null,
+        };
+        if (crisp) |ci| {
+            _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                .max_size_content = .{ .w = glyph_px, .h = glyph_px },
+                .id_extra = i,
+            });
+        }
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        dvui.labelNoFmt(@src(), r.label, .{}, .{
+            .font = t.font_body.withSize(11.0),
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+        });
+    }
+}
+
+// Modal confirm for a power action (GNOME's `…` dialogs): title +
+// "Are you sure you want to …?" with Cancel / Confirm. Log Out asks
+// the compositor to exit the session; Power Off / Restart go through
+// logind. Escape (handled by the caller) and Cancel dismiss.
+fn powerConfirmDialog(self: *HubUi, state: *State, t: *dvui.Theme) void {
+    const confirm = self.power_confirm orelse return;
+    const title: []const u8 = switch (confirm) {
+        .logout => "Log Out?",
+        .poweroff => "Power Off?",
+        .restart => "Restart?",
+    };
+    const question: []const u8 = switch (confirm) {
+        .logout => "Are you sure you want to log out?",
+        .poweroff => "Are you sure you want to power off?",
+        .restart => "Are you sure you want to restart?",
+    };
+    const note: []const u8 = switch (confirm) {
+        .logout => "Running applications will be closed.",
+        .poweroff => "The computer will be powered off.",
+        .restart => "The computer will be restarted.",
+    };
+    const confirm_label: []const u8 = switch (confirm) {
+        .logout => "Log Out",
+        .poweroff => "Power Off",
+        .restart => "Restart",
+    };
+
+    var card = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .background = true,
+        .color_fill = t.color(.content, .fill).lighten(5),
+        .corners = .all(10),
+        .padding = .all(16),
+        .margin = .{ .x = 4, .y = 8, .w = 4, .h = 0 },
+        .gravity_y = 0.5,
+    });
+    defer card.deinit();
+    dvui.labelNoFmt(@src(), title, .{ .align_x = 0.5 }, .{
+        .font = t.font_heading.withSize(13),
+        .expand = .horizontal,
+        .gravity_x = 0.5,
+    });
+    dvui.labelNoFmt(@src(), question, .{ .align_x = 0.5 }, .{
+        .font = t.font_body.withSize(11.0),
+        .expand = .horizontal,
+        .gravity_x = 0.5,
+        .margin = .{ .y = 6 },
+    });
+    dvui.labelNoFmt(@src(), note, .{ .align_x = 0.5 }, .{
+        .font = t.font_body.withSize(10.0),
+        .color_text = t.color(.content, .text).opacity(0.6),
+        .expand = .horizontal,
+        .gravity_x = 0.5,
+    });
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .h = 12 } });
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .background = false,
+        });
+        defer row.deinit();
+        _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+        if (dvui.button(@src(), "Cancel", .{}, .{})) {
+            self.power_confirm = null;
+        }
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        if (dvui.button(@src(), confirm_label, .{}, .{ .id_extra = 1 })) {
+            switch (confirm) {
+                .logout => {
+                    state.requestLogout();
+                    self.power_confirm = null;
+                    self.power_open = false;
+                    self.switchMode(.clock, state);
+                },
+                .poweroff => {
+                    if (State.Power.systemPowerOff()) {
+                        self.power_confirm = null;
+                        self.power_open = false;
+                    } else {
+                        self.power_confirm = null;
+                    }
+                },
+                .restart => {
+                    if (State.Power.systemReboot()) {
+                        self.power_confirm = null;
+                        self.power_open = false;
+                    } else {
+                        self.power_confirm = null;
+                    }
+                },
+            }
+        }
+        _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+    }
 }
 
 // Control-center activity section: one row per live mic/camera/share

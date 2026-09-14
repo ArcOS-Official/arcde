@@ -919,6 +919,7 @@ const AsyncOp = union(enum) {
     request_keyboard_focus: struct { namespace: []u8 },
     release_keyboard_focus: void,
     refresh_shell_focus: void,
+    exit_session: void,
 };
 
 const DummyMutex = struct {
@@ -962,6 +963,18 @@ pub fn isRequestKeyboardFocusActive() bool {
 
 pub fn isRequestKeyboardFocusPinned() bool {
     return request_keyboard_focus_active and request_keyboard_focus_pinned_during_mod;
+}
+
+/// Window behind a programmatic shell-focus request, if any (main thread).
+/// Used by window-keybinding targets (close/floating) so MOD+w works while
+/// the launcher/network panel holds focus: the shell surface is focused,
+/// but the user's window is still the request's `prev`.
+pub fn requestPrevWindow() ?*Window {
+    if (!request_keyboard_focus_active) return null;
+    return switch (request_keyboard_focus_prev) {
+        .window => |ref| ref.get(),
+        else => null,
+    };
 }
 
 /// Release a pinned request from the Seat's MOD-press handler (main thread).
@@ -1275,6 +1288,10 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                 last_shell_focus = null;
                 publishShellFocus(seat.isShellFocused());
             },
+            .exit_session => {
+                log.info("bank: exit_session requested -> terminating Wayland session", .{});
+                @import("Nile.zig").exitSession();
+            },
         }
     }
     return 0;
@@ -1485,6 +1502,10 @@ fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message
         },
         .release_keyboard_focus => blk: {
             queueAsync(.release_keyboard_focus);
+            break :blk .{ .pong = .{ .nonce = 0 } };
+        },
+        .exit_session => blk: {
+            queueAsync(.exit_session);
             break :blk .{ .pong = .{ .nonce = 0 } };
         },
         .full_image, .window_image => .{

@@ -64,6 +64,9 @@ pub const Action = union(enum) {
     // shared domain, so both count as focused. No heap: the worker fills
     // in the namespace string. Plain data by design.
     request_keyboard_focus: ShellFocusTarget,
+    // Ask the compositor to terminate the Wayland session (log out).
+    // Used by the power-menu Log Out confirm and any direct logout path.
+    exit_session: void,
     pub const ShellFocusTarget = enum { hub, bar };
     pub const CaptureWindow = struct {
         id: u64,
@@ -155,6 +158,10 @@ outputs: []proto.Output = &.{},
 // run on the UI thread (pushes arrive via the commit queue).
 launcher_open_pending: bool = false,
 launcher_close_pending: bool = false,
+// Compositor logout confirm (first MOD+Shift+q): the shell shows
+// "Are you sure you want to log out?" with Log Out / Cancel.
+// Set on the UI thread via applyEvent, consumed by HubUi.hubFrame.
+logout_prompt_pending: bool = false,
 
 // UI-thread thumbnail cache (see ImageEntry).
 images: ImageMap = undefined,
@@ -352,6 +359,13 @@ pub fn requestHubFocus(self: *State) void {
 // Ask for keyboard focus on the bar layer surface.
 pub fn requestBarFocus(self: *State) void {
     self.requestShellFocus(.bar);
+}
+
+// Ask the compositor to terminate the Wayland session (log out).
+// Enqueued for the worker like every other mutation; the compositor
+// acks with pong and then exits.
+pub fn requestLogout(self: *State) void {
+    self.req_q.push(self.alloc, self.io, .{ .exit_session = {} });
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +974,10 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
             var ev = try conn.requestCompositor(.{ .request_keyboard_focus = .{ .namespace = ns } }, .raw);
             defer ev.deinit(self.alloc);
         },
+        .exit_session => {
+            var ev = try conn.requestCompositor(.{ .exit_session = {} }, .raw);
+            defer ev.deinit(self.alloc);
+        },
     }
 }
 
@@ -1385,6 +1403,9 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
         },
         .launcher_closed => {
             self.launcher_close_pending = true;
+        },
+        .logout_prompt => {
+            self.logout_prompt_pending = true;
         },
         else => {},
     }

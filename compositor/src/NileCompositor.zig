@@ -369,8 +369,14 @@ pub const NileCompositor = struct {
     /// only swaps which tree is laid out — trees are never rebuilt, so each
     /// workspace keeps its splits/ratios across switches.
     roots: [ws_count]?Node = [_]?Node{null} ** ws_count,
+    /// First MOD+Shift+q press arms a logout confirm (monotonic ms,
+    /// wrapping like all input timestamps); a second press within
+    /// `logout_confirm_ms` exits the session.
+    logout_pending_ms: ?u32 = null,
 
     const ws_count: usize = @import("Workspace.zig").Manager.fixed_count;
+    /// Two-step logout window: first press prompts, second confirms.
+    const logout_confirm_ms: u32 = 10_000;
 
     /// Tree for the currently visible workspace.
     fn cur(self: *NileCompositor) *?Node {
@@ -453,6 +459,22 @@ pub const NileCompositor = struct {
                 return;
             };
             _ = b_fs;
+        }
+        // MOD+w: close focused window
+        {
+            const b = Nile.Seat.addXkbBinding(seat, xkb.Keysym.w, mod) catch |err| {
+                log.warn("failed to register window close binding: {}", .{err});
+                return;
+            };
+            _ = b;
+        }
+        // MOD+Shift+q: quit compositor (two-step: prompt, then confirm)
+        {
+            const b = Nile.Seat.addXkbBinding(seat, xkb.Keysym.q, shift_mod) catch |err| {
+                log.warn("failed to register session quit binding: {}", .{err});
+                return;
+            };
+            _ = b;
         }
     }
 
@@ -646,6 +668,23 @@ pub const NileCompositor = struct {
     }
 
     fn onKeybindPressed(self: *NileCompositor, binding: *XkbBinding) void {
+        // MOD+w: close focused window (no shift)
+        if (binding.keysym == xkb.Keysym.w) {
+            const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
+            if (!mods.shift) {
+                log.info("window keybinding: close focused window", .{});
+                self.closeFocusedWindow();
+                return;
+            }
+        }
+        // MOD+Shift+q: quit compositor (two-step confirm)
+        if (binding.keysym == xkb.Keysym.q) {
+            const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
+            if (mods.shift) {
+                self.requestLogoutConfirm();
+                return;
+            }
+        }
         // MOD+v: toggle workspace tiling/floating (no shift)
         if (binding.keysym == xkb.Keysym.v) {
             const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
@@ -840,6 +879,55 @@ pub const NileCompositor = struct {
                 return null;
             },
         }
+    }
+
+    /// Window behind the current focus for close semantics: the focused
+    /// window itself, or — while shell UI (launcher/panel) holds focus —
+    /// the window that was focused before the detour (MOD-tap prev or
+    /// programmatic request prev). Otherwise null (nothing to close).
+    fn resolveCloseTarget(self: *NileCompositor, seat: *@import("Seat.zig")) ?*Window {
+        _ = self;
+        switch (seat.focused) {
+            .window => |w| return w,
+            else => {
+                switch (seat.shell_mod.prev) {
+                    .window => |ref| if (ref.get()) |prev_win| return prev_win,
+                    else => {},
+                }
+                if (Bank.requestPrevWindow()) |prev_win| return prev_win;
+                return null;
+            },
+        }
+    }
+
+    fn closeFocusedWindow(self: *NileCompositor) void {
+        const seat = Nile.Seat.default();
+        const win = self.resolveCloseTarget(seat) orelse {
+            log.info("close window: no target window", .{});
+            return;
+        };
+        log.info("window {?s} close requested (MOD+w)", .{win.getTitle()});
+        Nile.Window.close(win);
+    }
+
+    /// Two-step logout: first MOD+Shift+q arms the confirm and broadcasts
+    /// `logout_prompt` so the shell shows "Are you sure you want to log
+    /// out?"; a second press within the window exits the session.
+    /// Shell power-menu logout confirms in UI and calls `exit_session`
+    /// directly, bypassing this arming.
+    fn requestLogoutConfirm(self: *NileCompositor) void {
+        const now = @import("util.zig").msecTimestamp();
+        if (self.logout_pending_ms) |armed| {
+            if (now -% armed < logout_confirm_ms) {
+                self.logout_pending_ms = null;
+                log.info("session quit confirmed -> terminating Wayland session", .{});
+                Nile.exitSession();
+                return;
+            }
+        }
+        self.logout_pending_ms = now;
+        log.info("session quit requested: are you sure you want to log out? Press MOD+Shift+q again to confirm.", .{});
+        Bank.broadcast(.{ .logout_prompt = {} });
     }
 
     fn toggleFocusedWindowFullscreen(self: *NileCompositor) void {

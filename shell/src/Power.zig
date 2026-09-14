@@ -29,6 +29,39 @@ pub const Status = struct {
     full: bool = false,
 };
 
+// System power actions via logind (org.freedesktop.login1.Manager).
+// Called from the control-center power menu; fire-and-forget: a
+// successful call ends the session/machine, so there is no model to
+// update. Returns true when the D-Bus call was delivered.
+const login1_dest = "org.freedesktop.login1";
+const login1_path = "/org/freedesktop/login1";
+const login1_iface = "org.freedesktop.login1.Manager";
+
+fn callLogin1(member: [*:0]const u8) bool {
+    const bus = Dbus.openSystem() orelse return false;
+    defer Dbus.closeBus(bus);
+    var m = Dbus.Method.init(bus, .{
+        .destination = login1_dest,
+        .path = login1_path,
+        .interface = login1_iface,
+        .member = member,
+    }, .{false}) orelse return false;
+    defer m.deinit();
+    var r = m.send(bus) orelse return false;
+    defer r.deinit();
+    return true;
+}
+
+/// Power off the machine (logind PowerOff, non-interactive).
+pub fn systemPowerOff() bool {
+    return callLogin1("PowerOff");
+}
+
+/// Reboot the machine (logind Reboot, non-interactive).
+pub fn systemReboot() bool {
+    return callLogin1("Reboot");
+}
+
 mu: std.Io.Mutex = .init,
 alloc: std.mem.Allocator = undefined,
 io: std.Io = undefined,

@@ -1,0 +1,2614 @@
+const std = @import("std");
+const dvui = @import("dvui");
+const Icons = @import("Icons.zig");
+const AlignedEntry = @import("AlignedEntry.zig");
+const State = @import("State.zig");
+
+hubmode: HubMode = .clock,
+last_hubmode: HubMode = .clock,
+anim_id: dvui.Id = undefined,
+hub_was_hovered: bool = false,
+windows_need_focus: bool = false,
+launcher_need_focus: bool = false,
+
+hub_from: dvui.Size = .{ .w = 150, .h = 50 },
+hub_target: ?dvui.Size = null,
+hub_cur: dvui.Size = .{ .w = 150, .h = 50 },
+hub_surfaced: dvui.Size = .{ .w = 150, .h = 50 },
+
+switcher_pending: bool = false,
+switcher_armed_ms: u64 = 0,
+selected: usize = 0,
+
+// Compositor-authoritative hub keyboard focus. Written by State's worker
+// thread when the compositor broadcasts `shell_focus_changed` (see
+// State.bindHubFocus); read by the UI thread every frame for the
+// focus-loss edge in updateSwitcher. Atomic so the cross-thread store
+// never races a frame read. `hub_prev_*` stays a plain bool: it is
+// UI-edge state, only ever touched between frames.
+hub_keyboard_focused: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+hub_prev_keyboard_focused: bool = true,
+
+launcher_query: []const u8 = "",
+
+net_sel: ?u64 = null,
+net_sel_open: bool = false,
+net_need_focus: bool = false,
+// In-flight connect/disconnect request + the AP row it belongs to (an
+// ApView.id, 0 = none). The row shows "Connecting…" while pending and
+// the daemon's last_error under that row on failure.
+net_req: ?State.Net.Request = null,
+net_req_ap: u64 = 0,
+// Row resize animation: the AP that was displayed open when the latest
+// toggle started (null = none) + start ms. Heights lerp 38<->72 on the
+// hub curve at 75% of hub time (see net_anim_ms). Shared clock covers
+// both the collapsing and the expanding row on a selection swap.
+net_anim_open_ap: ?u64 = null,
+net_anim_start: u64 = 0,
+// MRU head window id when the network panel opened (0 = none/empty).
+// If it changes, the user focused an app elsewhere: close the panel.
+net_open_win: u64 = 0,
+// Error display clock: frames since the current error appeared (drives
+// the red flash schedule) + ms timestamp (drives the 5s auto-dismiss).
+net_err_frame: u32 = 0,
+net_err_since: u64 = 0,
+// Wrong-password reject animation for the open row's password entry:
+// start ms (0 = idle). While `now - start < net_reject_ms` the entry
+// wiggles horizontally and its focus outline draws red; the entry also
+// re-arms for typing (saved-password graying is bypassed until edited
+// again). Stamped when a connect request on this row fails.
+net_reject_since: u64 = 0,
+net_reject_ap: u64 = 0,
+// Last ms timestamp the open network panel asked the worker for fresh
+// state (see the steady-timer block in hubFrame). Gates re-requests to
+// the shared 750ms cadence even while fast-ticking for the spinner.
+net_last_refresh: u64 = 0,
+// Last applied keyboard-interactivity mode (null = never applied).
+// hubFrame syncs it from hubmode, cached like pushHubSurface.
+kb_exclusive: ?bool = null,
+// Set alongside an explicit focusWindow so the clock-entry push below
+// doesn't immediately override it with the (stale) MRU head.
+suppress_clock_push: bool = false,
+
+// Set by the bar window's network button; consumed at the top of the next
+// hubFrame. switchMode must run in the hub window's context: dvui
+// animations are stored per-window, so starting the resize from the bar
+// frame registers it on the wrong window and the hub never sees it
+// (clock -> network snapped instead of animating).
+net_toggle_pending: bool = false,
+
+// Controls <-> network transition, start ms (null = idle). Set by
+// openNetworkFaded / closeNetworkFaded at click time; the hub renders the
+// outgoing mode for the first half of the fade (fading out) and hubFrame
+// commits to the incoming mode at the midpoint (fading in), all while the
+// hub resize kicked at click time runs its course. `fade_to_controls`
+// marks the direction: open (false) renders controls -> network, close
+// (true) renders network -> controls.
+controls_fade_start: ?u64 = null,
+fade_to_controls: bool = false,
+
+// Network panel tab. Both tabs share the panel chrome with small
+// per-tab differences (wifi: search + AP rows with connect;
+// bluetooth: device rows, status only — the worker exposes no BT
+// connect actions).
+net_tab: NetTab = .wifi,
+// Back-button origin: set to .controls whenever a sub-panel (network,
+// launcher, windows) opens FROM the control center, null when it opened
+// from the base UI (clock, bar button, / or Tab key). Only the network
+// header's back button reads it (the sole path back to the control
+// center, riding the close fade); Escape and keyboard-focus loss always
+// dismiss to clock, from every mode. Cleared on entering clock or
+// controls themselves.
+menu_origin: ?HubMode = null,
+// Set while a media button holds the click this frame (see clockPlayer):
+// the clock background must not treat it as a background click. Reset
+// by tophubBase every frame, read by the clock branch after it.
+media_clicked: bool = false,
+
+off_start: u64 = 0,
+
+const HubUi = @This();
+
+pub const HubMode = enum {
+    clock,
+    network,
+    windows,
+    launcher,
+    search,
+    controls,
+};
+
+// Network panel tab (see net_tab).
+pub const NetTab = enum {
+    wifi,
+    bluetooth,
+};
+
+pub const KeyAction = enum {
+    down,
+    repeat,
+    up,
+};
+
+pub fn init() HubUi {
+    return .{ .anim_id = .extendId(null, @src(), 0) };
+}
+
+// UI-thread read of the compositor-driven focus flag (see the field
+// comment). Short helpers so frame logic stays readable.
+pub fn hubFocused(self: *const HubUi) bool {
+    return self.hub_keyboard_focused.load(.seq_cst);
+}
+
+pub fn setHubFocused(self: *HubUi, focused: bool) void {
+    self.hub_keyboard_focused.store(focused, .seq_cst);
+}
+
+pub fn targetFor(mode: HubMode) dvui.Size {
+    return targetForMedia(mode, false);
+}
+
+// Media-aware hub sizes. Faithful to LeafShell's tophub: the clock hub is
+// always a single 50px row — 150px idle, widening to 444px when a track is
+// active: 132 clock + 26 music glyph + 160 capped title + 84 media buttons
+// (= 402) plus the 12-unit row padding on each edge and the outer chrome.
+// Sized to hug the content so the expanding text column can't leave a
+// void at the end of the pill. The control center keeps the whole
+// clock (with its player extension) attached at the top, so it is taller.
+//
+// Activity indicators (recording/share/camera/mic/download) hang on the
+// right of the clock strip, 30px each: targetForFull adds that budget.
+pub const indicator_px: f32 = 24;
+
+pub fn targetForMedia(mode: HubMode, has_media: bool) dvui.Size {
+    return targetForFull(mode, has_media, 0);
+}
+
+pub fn targetForFull(mode: HubMode, has_media: bool, n_indicators: usize) dvui.Size {
+    var s = switch (mode) {
+        .windows => dvui.Size{ .w = 600, .h = 120 },
+        .launcher => dvui.Size{ .w = 520, .h = 360 },
+        .network => dvui.Size{ .w = 520, .h = 420 },
+        .clock => if (has_media) dvui.Size{ .w = 444, .h = 50 } else dvui.Size{ .w = 150, .h = 50 },
+        .controls => dvui.Size{ .w = 520, .h = 412 },
+        else => dvui.Size{ .w = 480, .h = 180 },
+    };
+    if ((mode == .clock or mode == .controls) and n_indicators > 0) {
+        s.w += @as(f32, @floatFromInt(n_indicators)) * indicator_px;
+    }
+    return s;
+}
+
+// Open the network panel from the control center with a fade: the
+// resize starts now, controls render fading out for the first half,
+// and hubFrame commits to .network at the midpoint (fading in). From
+// anywhere else (or mid-fade) this is a plain switchMode. A non-null
+// tab selects the panel tab; null keeps the current one.
+pub fn openNetworkFaded(self: *HubUi, state: *State, tab: ?NetTab) void {
+    if (tab) |nt| self.net_tab = nt;
+    if (self.hubmode != .controls or self.controls_fade_start != null) {
+        if (self.hubmode != .network) self.switchMode(.network, state);
+        return;
+    }
+    // Origin for the header back button (the only path back to the
+    // control center once the panel is open).
+    self.menu_origin = .controls;
+    self.controls_fade_start = @as(u64, @intCast(std.Io.Clock.real.now(state.io).toMilliseconds()));
+    self.fade_to_controls = false;
+    // Kick the resize now so it runs under the whole fade; the midpoint
+    // switchMode re-sets the same target (a no-op) so the animation is
+    // never restarted.
+    self.setTarget(targetFor(.network));
+    dvui.animation(self.anim_id, "hubfade", .{
+        .easing = dvui.easing.outQuart,
+        .end_time = 0.18 * std.time.us_per_s,
+    });
+}
+
+// Close the network panel back to the control center with a fade: the
+// mirror of openNetworkFaded. The resize starts now, network renders
+// fading out for the first half, and hubFrame commits to .controls at
+// the midpoint (fading in). Only valid mid-network with a controls
+// origin; anything else is a plain switchMode.
+pub fn closeNetworkFaded(self: *HubUi, state: *State) void {
+    if (self.hubmode != .network or self.controls_fade_start != null) {
+        self.switchMode(.controls, state);
+        return;
+    }
+    self.controls_fade_start = @as(u64, @intCast(std.Io.Clock.real.now(state.io).toMilliseconds()));
+    self.fade_to_controls = true;
+    self.setTarget(targetFor(.controls));
+    dvui.animation(self.anim_id, "hubfade", .{
+        .easing = dvui.easing.outQuart,
+        .end_time = 0.18 * std.time.us_per_s,
+    });
+}
+
+pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
+    self.off_start = @as(u64, @intCast(std.Io.Clock.real.now(state.io).toMilliseconds()));
+    defer self.suppress_clock_push = false;
+    // Origin bookkeeping: a sub-panel opened from the control center is
+    // its child, which only matters for the header back button (the sole
+    // path back to the control center, riding the close fade). Escape
+    // and focus loss always dismiss to clock, from every mode. The
+    // origin persists while navigating between panels (controls ->
+    // network -> launcher is still a controls session) and retires only
+    // when the session ends: entering clock or controls itself. The
+    // controls -> network fade stamps the origin itself; the midpoint
+    // commit below re-enters .network with hubmode == .controls, which
+    // keeps it.
+    if (mode == .clock or mode == .controls) self.menu_origin = null;
+    if (mode == .network and self.hubmode != .controls and self.controls_fade_start == null) {
+        // Opened directly (bar button, key): not a controls session.
+        // Mid-fade commit is exempt (controls_fade_start still set).
+        self.menu_origin = null;
+    }
+    if (self.hubmode == .controls and (mode == .network or mode == .launcher or mode == .windows)) {
+        // Any sub-panel opened FROM the control center starts a
+        // controls session (network stamps it in openNetworkFaded too;
+        // this also covers the fade midpoint commit re-entering
+        // .network, which must keep the origin).
+        self.menu_origin = .controls;
+    }
+    // Leaving a fading mode drops an in-flight transition, so no stale
+    // fade alpha leaks onto the next mode. The two fade midpoint commits
+    // (.controls -> .network opening, .network -> .controls closing) are
+    // exempt so their second halves still fade in.
+    if (self.controls_fade_start != null) {
+        const fading_commit = (self.hubmode == .controls and mode == .network and !self.fade_to_controls) or
+            (self.hubmode == .network and mode == .controls and self.fade_to_controls);
+        if (!fading_commit) self.controls_fade_start = null;
+    }
+    if (mode == .clock and self.hubmode != .clock) {
+        // Clock mode never holds keyboard focus: push it back to the
+        // user's app. Windows stay in MRU focus order, so the head is
+        // the last focused non-shell window (shell surfaces never enter
+        // this list). Only when the hub actually holds focus — if focus
+        // already moved elsewhere (click), there is nothing to push.
+        // Skipped right after an explicit focusWindow (switcher), which
+        // names its own target.
+        if (!self.suppress_clock_push and self.hubFocused() and state.windows.len > 0) {
+            state.focusWindow(state.windows[0].id);
+        }
+    }
+    if (mode == .windows) {
+        if (state.windows.len == 0)
+            return;
+        state.prefetchWindowImages();
+        if (self.hubmode != .windows) {
+            if (!self.switcher_pending) self.selectIndex(state, 0);
+            self.windows_need_focus = true;
+        }
+    }
+    // Opening a menu from clock mode takes keyboard focus: the
+    // compositor grants it on request, so typing lands in the panel
+    // and later focus loss has a clean edge to dismiss on. Every open
+    // funnels through clock (dismissals always land there), so this
+    // covers all of them exactly once.
+    if (self.hubmode == .clock and mode != .clock) {
+        state.requestHubFocus();
+        // Swallow any focus edge in flight at open time: the request
+        // above is asynchronous, and the click that opened the panel
+        // may have moved focus away from the hub surface a moment ago.
+        // Syncing prev here means the edge detector only fires on
+        // transitions observed AFTER the open — a loss must first be
+        // preceded by a polled frame with focus actually granted.
+        self.hub_prev_keyboard_focused = self.hubFocused();
+    }
+    if (mode == .launcher) {
+        if (self.hubmode != .launcher) {
+            self.launcher_need_focus = true;
+            self.last_hubmode = self.hubmode;
+        }
+    }
+    if (mode == .network) {
+        if (self.hubmode != .network) {
+            self.clearNetSel(state);
+            self.net_need_focus = true;
+            // Baseline for the focus-elsewhere detector: MRU head is the
+            // focused app window (shell surfaces never enter the list).
+            self.net_open_win = if (state.windows.len > 0) state.windows[0].id else 0;
+            _ = state.net.refresh();
+        }
+    }
+    if (mode != .launcher and mode != .windows and mode != .network and self.hubmode == .launcher) {
+        // leaving launcher keeps last_hubmode as is
+    } else if (mode != .windows and mode != .launcher and mode != .network) {
+        self.last_hubmode = mode;
+    }
+    self.hubmode = mode;
+    self.setTarget(targetForFull(mode, state.media.active(), indicatorCount(state)));
+}
+
+/// Live activity-indicator count for pill sizing (no allocation).
+fn indicatorCount(state: *State) usize {
+    return state.activity.counts().total();
+}
+
+fn clearNetSel(self: *HubUi, state: *State) void {
+    _ = state;
+    self.net_sel = null;
+    self.net_sel_open = false;
+    self.net_req_ap = 0;
+    self.net_reject_since = 0;
+    self.net_reject_ap = 0;
+}
+
+// Where a dismissal (Escape, keyboard-focus loss) lands: always clock,
+// from every mode. The controls back button is the only path back to
+// the control center (it rides the close fade); Escape and focus loss
+// end the session outright.
+fn dismissHome(self: *HubUi, state: *State) void {
+    self.switchMode(.clock, state);
+}
+
+pub fn handleNetworkKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, state: *State) bool {
+    if (code == .escape and action == .down) {
+        self.clearNetSel(state);
+        self.dismissHome(state);
+        return true;
+    }
+    return false;
+}
+
+// Frame-context key check: true when `code` went down in the current
+// frame's event queue. Peeks without consuming, so widget handlers still
+// see the event. For named keybinds prefer ke.matchBind; raw codes have
+// no bind entries (dvui registers no "esc"/"escape" bind — escape must
+// match by code, as handleNetworkKey does), hence this helper.
+pub fn pressed(code: dvui.enums.Key) bool {
+    for (dvui.events()) |ev| {
+        if (ev.evt != .key) continue;
+        const k = ev.evt.key;
+        if (k.action == .down and k.code == code) return true;
+    }
+    return false;
+}
+
+// Bar-button entry point (deferred via net_toggle_pending so the mode
+// switch — and its resize animation — runs in hub context).
+pub fn toggleNetworkMenu(self: *HubUi, state: *State) void {
+    // A controls -> network fade already converges on the open panel;
+    // ignore bar toggles until it settles (180ms).
+    if (self.controls_fade_start != null) return;
+    if (self.hubmode == .network) {
+        self.clearNetSel(state);
+        // Closing from the bar always lands in clock mode (like every
+        // dismissal: Escape and focus loss also land in clock, from
+        // every mode; only the header back button returns to controls).
+        self.switchMode(.clock, state);
+    } else if (self.hubmode == .controls) {
+        // Same fade as tapping a toggle: resize starts now, the mode
+        // commits at the fade midpoint in hubFrame. No tab hint from
+        // the bar: keep the current tab.
+        self.openNetworkFaded(state, null);
+    } else {
+        // Focus-loss dismissal right after opening is suppressed by
+        // updateSwitcher's settle window (off_start); no manual
+        // prev-focus patching needed here.
+        self.switchMode(.network, state);
+    }
+}
+
+pub fn selectIndex(self: *HubUi, state: *State, idx: usize) void {
+    if (state.windows.len == 0) {
+        self.selected = 0;
+        return;
+    }
+    self.selected = idx % state.windows.len;
+}
+
+pub fn selectNext(self: *HubUi, state: *State) void {
+    self.selectIndex(state, self.selected + 1);
+}
+
+pub fn selectPrev(self: *HubUi, state: *State) void {
+    if (state.windows.len == 0) {
+        self.selected = 0;
+        return;
+    }
+    self.selected = (self.selected + state.windows.len - 1) % state.windows.len;
+}
+pub fn commitSwitcherSelection(self: *HubUi, state: *State) void {
+    if (state.windows.len == 0) return;
+    if (self.selected >= state.windows.len) self.selectIndex(state, self.selected);
+    state.focusWindow(state.windows[self.selected].id);
+    // Names its own focus target: a clock entry right after this must
+    // not override it with the stale MRU head (see switchMode).
+    self.suppress_clock_push = true;
+}
+
+// Queue a NetworkManager connect for `ap` (activating a new connection
+// implicitly swaps out whatever is active on the device) and track the
+// request so the row can report progress/errors.
+pub fn connectToAp(self: *HubUi, state: *State, dev_path: []const u8, ap: State.Net.ApView, password: []const u8) void {
+    self.net_reject_since = 0;
+    self.net_reject_ap = 0;
+    self.net_req = state.net.connect(dev_path, ap.path, ap.ssid, password);
+    self.net_req_ap = ap.id;
+}
+
+// Activate the stored NM profile for this AP: NM supplies the saved
+// secret, so no password round-trip. Used when the row is in the
+// "saved" state and the user hasn't typed an override.
+pub fn connectToApSaved(self: *HubUi, state: *State, dev_path: []const u8, ap: State.Net.ApView) void {
+    self.net_reject_since = 0;
+    self.net_reject_ap = 0;
+    self.net_req = state.net.connectSaved(dev_path, ap.path, ap.saved_path);
+    self.net_req_ap = ap.id;
+}
+
+pub fn disconnectAp(self: *HubUi, state: *State, ap: State.Net.ApView) void {
+    self.net_req = state.net.disconnect();
+    self.net_req_ap = ap.id;
+}
+
+// Millisecond age that saturates to 0 instead of underflowing when
+// `since_ms` is newer than `now_ms` (a fresh clock read taken after
+// the frame's `now`, e.g. switchMode stamping off_start at the fade
+// midpoint commit — plain subtraction panics there in safe mode).
+pub fn saturatingAge(now_ms: u64, since_ms: u64) u64 {
+    return if (now_ms >= since_ms) now_ms - since_ms else 0;
+}
+
+// Error flash schedule: 10-frame periods (5 red, 5 transparent),
+// twice, then steady transparent.
+pub fn errFlashRed(frame: u32) bool {
+    return frame < 20 and frame % 10 < 5;
+}
+
+// Row expand/collapse animation: same curve as the hub resize
+// (outQuart) at 75% of hub time (180ms -> 135ms).
+pub const net_anim_ms: u64 = 135;
+// Wrong-password wiggle duration (also bounds the red focus outline).
+pub const net_reject_ms: u64 = 500;
+// Controls -> network open-transition duration. Matches the hub resize
+// (180ms) so the fade-out/fade-in rides the whole resize.
+pub const controls_fade_ms: u64 = 180;
+// Open = 12 padding + 32 header + 28 controls; shut = 12 + 32. These
+// must equal the natural heights, or the animation pin starts/ends
+// with a jump that reads as overshoot.
+const net_row_open_h: f32 = 72;
+const net_row_shut_h: f32 = 44;
+
+// Eased 0..1 progress on the shared resize clock: the hub curve
+// (outQuart) at 75% of hub time. Drives row heights and the color
+// fades that ride along with them.
+pub fn animFrac(start_ms: u64, now_ms: u64) f32 {
+    const el = now_ms -% start_ms;
+    if (el >= net_anim_ms) return 1;
+    return dvui.easing.outQuart(@as(f32, @floatFromInt(el)) / @as(f32, @floatFromInt(net_anim_ms)));
+}
+
+// Activity-indicator breathe: same curve as the size changers
+// (outQuart), 0.1s per color transition, 3% brightness swing. Each 1s
+// loop holds dim, eases dim->bright (+3) over 0.1s, holds bright, then
+// eases back — so the blink reads as a subtle breathe instead of a
+// snap. Pure function of the wall clock (no per-icon animation state),
+// headless-testable like animFrac. Takes the wall-clock ms as u64 so
+// phase is computed with integer modulo BEFORE any f32 conversion:
+// converting the full epoch ms to f32 first quantizes away the
+// fractional phase and freezes the pulse.
+pub const indicator_period_ms: u64 = 1000;
+pub const indicator_trans_ms: u64 = 300;
+pub const indicator_brighten: f32 = 6.0;
+
+pub fn indicatorAmt(now_ms: u64) f32 {
+    const phase = now_ms % indicator_period_ms;
+    const hold_ms = indicator_period_ms / 2 - indicator_trans_ms; // 400
+    if (phase < hold_ms) return 0;
+    if (phase < hold_ms + indicator_trans_ms) {
+        const t = @as(f32, @floatFromInt(phase - hold_ms)) / @as(f32, @floatFromInt(indicator_trans_ms));
+        return indicator_brighten * dvui.easing.outQuart(t);
+    }
+    if (phase < hold_ms + indicator_trans_ms + hold_ms) return indicator_brighten;
+    const t = @as(f32, @floatFromInt(phase - (hold_ms + indicator_trans_ms + hold_ms))) / @as(f32, @floatFromInt(indicator_trans_ms));
+    return indicator_brighten * (1.0 - dvui.easing.outQuart(t));
+}
+
+// macOS-style activity spinner: 12 thick spokes around a circle, lit
+// head with fading tail, ~1 rev/sec. Generic over rect/color so the
+// headless test builds (which never instantiate hubFrame) skip dvui
+// drawing entirely.
+fn drawSpinner(rs: anytype, now_ms: u64, color: anytype) void {
+    if (rs.r.empty()) return;
+    const r = rs.r;
+    const s = rs.s;
+    const cx = r.x + r.w / 2;
+    const cy = r.y + r.h / 2;
+    const rad = @min(r.w, r.h) / 2;
+    const phase: usize = @as(usize, @intCast(now_ms / 80)) % 12;
+    var k: usize = 0;
+    while (k < 12) : (k += 1) {
+        const a = @as(f32, @floatFromInt(k)) * std.math.pi / 6.0;
+        const dx = @cos(a);
+        const dy = @sin(a);
+        var path = dvui.Path.Builder.init(dvui.currentWindow().lifo());
+        defer path.deinit();
+        path.addPoint(.{ .x = cx + dx * rad * 0.55, .y = cy + dy * rad * 0.55 });
+        path.addPoint(.{ .x = cx + dx * rad * 0.92, .y = cy + dy * rad * 0.92 });
+        const age = (phase + 12 - k) % 12;
+        const alpha = 1.0 - @as(f32, @floatFromInt(age)) * (0.85 / 11.0);
+        path.build().stroke(.{
+            .thickness = rad * 0.30 * s,
+            .color = color.opacity(alpha),
+            .endcap_style = .square,
+        });
+    }
+}
+
+// Displayed height for one AP row. Rows shown open at the last toggle
+// start from the open height, all others from shut; both converge on
+// their target, so a selection swap animates both sides at once.
+pub fn netRowHeight(self: *HubUi, ap_id: u64, open: bool, now_ms: u64) f32 {
+    const target: f32 = if (open) net_row_open_h else net_row_shut_h;
+    if (now_ms -% self.net_anim_start >= net_anim_ms) return target;
+    const from: f32 = if (self.net_anim_open_ap != null and ap_id == self.net_anim_open_ap.?)
+        net_row_open_h
+    else
+        net_row_shut_h;
+    if (from == target) return target;
+    return std.math.lerp(from, target, animFrac(self.net_anim_start, now_ms));
+}
+
+pub fn setTarget(self: *HubUi, t: dvui.Size) void {
+    if (self.hub_target) |ta| {
+        if (ta.w == t.w and ta.h == t.h) return;
+    } else if (self.hub_cur.w == t.w and self.hub_cur.h == t.h) {
+        return;
+    }
+    self.hub_target = t;
+    self.hub_from = self.hub_cur;
+    dvui.animation(self.anim_id, "hubsize", .{
+        .easing = dvui.easing.outQuart,
+        .end_time = 0.18 * std.time.us_per_s,
+    });
+}
+
+pub fn pushHubSurface(self: *HubUi, t: dvui.Size, ctx_hub_g: anytype) void {
+    if (self.hub_surfaced.w == t.w and self.hub_surfaced.h == t.h) return;
+    self.hub_surfaced = t;
+    ctx_hub_g.setSize(
+        @as(u32, @intFromFloat(@round(t.w))),
+        @as(u32, @intFromFloat(@round(t.h))),
+    );
+}
+
+pub fn handleGlobalKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, shift: bool, now_ms: u64, state: *State) bool {
+    const is_tab_down = code == .tab and action == .down;
+    if (is_tab_down) {
+        if (self.hubmode == .windows) {
+            return false;
+        }
+        if (self.hubFocused()) {
+            if (state.windows.len == 0) return false;
+            if (shift) {
+                self.selectPrev(state);
+            } else {
+                self.selectNext(state);
+            }
+            if (!self.switcher_pending) {
+                self.switcher_pending = true;
+                self.switcher_armed_ms = now_ms;
+            }
+            return true;
+        }
+    }
+    if (action == .down) {
+        if (code == .slash or code == .p) {
+            if (self.hubmode != .launcher) {
+                self.switchMode(.launcher, state);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+pub fn handleLauncherKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, state: *State) bool {
+    if (code == .escape and action == .down) {
+        self.dismissHome(state);
+        return true;
+    }
+    if (code == .enter and action == .down) {
+        if (state.launcher.search(self.launcher_query)) |apps| {
+            if (apps.len > 0) {
+                var idx: usize = 0;
+                for (state.launcher.data.items, 0..) |*a, j| if (a == apps[0]) {
+                    idx = j;
+                    break;
+                };
+                state.launcher.run(idx);
+                self.switchMode(.clock, state);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+pub fn handleWindowsKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, state: *State) bool {
+    if (code == .escape and action == .down) {
+        self.switcher_pending = false;
+        self.selectIndex(state, 0);
+        self.dismissHome(state);
+        return true;
+    }
+    return false;
+}
+
+pub fn updateSwitcher(self: *HubUi, now_ms: u64, state: *State) HubMode {
+    if (self.switcher_pending and self.hubmode != .windows and now_ms -% self.switcher_armed_ms >= 180) {
+        self.switchMode(.windows, state);
+    }
+    // Single owner of the focus edge. switchMode syncs prev at open
+    // time (see its requestHubFocus block), so an edge here is always a
+    // transition observed across polled frames after the open: a panel
+    // that never gained focus can't dismiss via a stale pre-open edge.
+    const focus_lost = !self.hubFocused() and self.hub_prev_keyboard_focused;
+    if (focus_lost) {
+        // Losing keyboard focus always dismisses to clock, from every
+        // mode. The hub is a transient overlay, never a place to linger
+        // unfocused.
+        if (self.switcher_pending or self.hubmode == .windows) {
+            if (state.windows.len > 0) self.commitSwitcherSelection(state);
+            self.switcher_pending = false;
+            self.selectIndex(state, 0);
+        } else {
+            self.switcher_pending = false;
+        }
+        if (self.hubmode == .network) {
+            self.clearNetSel(state);
+        }
+        if (self.hubmode != .clock) {
+            self.dismissHome(state);
+        }
+    }
+    return self.hubmode;
+}
+pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _win_hub: anytype) !dvui.App.Result {
+    _ = _io;
+    _ = _win_hub;
+    var t = &dvui.currentWindow().theme;
+    const base = t.color(.content, .fill);
+
+    // Bar-window requests run here so switchMode (and its resize
+    // animation) executes in hub context. See net_toggle_pending.
+    if (self.net_toggle_pending) {
+        self.net_toggle_pending = false;
+        self.toggleNetworkMenu(state);
+    }
+
+    // Media/activity-driven hub resize: when a player or an activity
+    // indicator appears/disappears while the clock or control center is
+    // open, converge on the matching size. setTarget is a no-op when the
+    // size already matches, so running this every frame is free. Other
+    // panels override entirely (no clock).
+    {
+        const want_media = state.media.active();
+        const n_ind = if (self.hubmode == .clock or self.hubmode == .controls) indicatorCount(state) else 0;
+        if (self.hubmode == .clock or self.hubmode == .controls) {
+            self.setTarget(targetForFull(self.hubmode, want_media, n_ind));
+        }
+        // While a track plays the seek bar interpolates locally, but it
+        // still needs frames to advance: tick hot at 4fps. Paused/stopped
+        // falls back to the loop's normal input-driven wakeups. Active
+        // activity indicators breathe on the hub curve (0.1s eased edges),
+        // so they need frames too — ~30fps so the short glide stays
+        // smooth.
+        var hot_us: ?i32 = null;
+        if (want_media and (self.hubmode == .clock or self.hubmode == .controls)) {
+            var msnap_hot = state.media.snapshotCopy(state.alloc);
+            defer msnap_hot.deinit(state.alloc);
+            if (msnap_hot.status == .playing) hot_us = 250_000;
+        }
+        if (n_ind > 0 and (self.hubmode == .clock or self.hubmode == .controls)) hot_us = 33_333;
+        if (hot_us) |micros| {
+            if (dvui.timerDone(self.anim_id)) {
+                dvui.timer(self.anim_id, micros);
+            } else if (dvui.timerGet(self.anim_id) == null) {
+                dvui.timer(self.anim_id, micros);
+            }
+        }
+    }
+
+    // Keyboard focus follows the panel: exclusive asks the compositor
+    // to focus the hub surface while a panel is open (typing lands in
+    // the search/password entries); clock releases it — focus itself
+    // goes back to the app via switchMode. Cached on change, like
+    // pushHubSurface, so the protocol call doesn't fire every frame.
+    {
+        const want_excl = self.hubmode != .clock;
+        if (self.kb_exclusive == null or self.kb_exclusive.? != want_excl) {
+            self.kb_exclusive = want_excl;
+            ctx_hub_g.setKeyboardInteractivity(if (want_excl) .exclusive else .on_demand);
+        }
+    }
+
+    const hub_anim = dvui.animationGet(self.anim_id, "hubsize");
+    if (self.hub_target) |ta| {
+        if (hub_anim) |a| {
+            self.hub_cur.w = std.math.lerp(self.hub_from.w, ta.w, a.value());
+            self.hub_cur.h = std.math.lerp(self.hub_from.h, ta.h, a.value());
+            if (a.done()) self.hub_cur = ta;
+        } else {
+            self.hub_cur = ta;
+        }
+    }
+
+    if (self.hub_target) |ta| {
+        const expanding = ta.w > self.hub_from.w or ta.h > self.hub_from.h;
+        const done = hub_anim == null or hub_anim.?.done();
+        if (expanding) {
+            self.pushHubSurface(ta, ctx_hub_g);
+            if (done) {
+                self.hub_target = null;
+                self.hub_from = ta;
+            }
+        } else if (done) {
+            self.hub_cur = ta;
+            self.pushHubSurface(ta, ctx_hub_g);
+            self.hub_target = null;
+            self.hub_from = ta;
+        }
+    }
+
+    const outer = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .min_size_content = self.hub_cur,
+        .max_size_content = .size(self.hub_cur),
+        .background = true,
+        .color_fill = base,
+        .color_border = t.color(.content, .text).opacity(0.15),
+        .border = .all(1),
+        .corners = .all(10),
+        .padding = .fromSize(.{ .w = 4 }),
+        .gravity_y = 0.0,
+        .gravity_x = 0.5,
+    });
+    defer outer.deinit();
+    // Forceful resize: the pinned min/max above holds the surface on the
+    // animated size; crop children to it so a taller panel can't paint
+    // past the frame while it grows or shrinks.
+    const hub_clip_prev = dvui.clip(outer.data().borderRectScale().r);
+    defer dvui.clipSet(hub_clip_prev);
+
+    const now = @as(u64, @intCast(std.Io.Clock.real.now(state.io).toMilliseconds()));
+
+    // Prev tracks the last frame's polled value; updateSwitcher owns the
+    // edge detection above, so no manual syncing is needed anywhere else.
+    defer self.hub_prev_keyboard_focused = self.hubFocused();
+
+    for (dvui.events()) |ev| {
+        if (ev.evt != .key) continue;
+        const k = ev.evt.key;
+        const action: KeyAction = switch (k.action) {
+            .down => .down,
+            .up => .up,
+            else => .repeat,
+        };
+        // Same helpers the headless JSON harness drives, so tested
+        // behavior is the wired behavior. Focus-loss dismissal is
+        // updateSwitcher's job (edge + settle logic live there); key
+        // events never trigger it.
+        if (self.handleGlobalKey(k.code, action, k.mod.shift(), now, state)) break;
+        if (ev.evt.key.code == .escape and !self.hubFocused())
+            self.switchMode(.clock, state);
+    }
+
+    _ = self.updateSwitcher(now, state);
+
+    // Controls <-> network transition (see openNetworkFaded /
+    // closeNetworkFaded): the resize was kicked at click time. The
+    // first half renders the outgoing mode fading out; at the midpoint
+    // the mode commits so the second half renders the incoming mode
+    // fading in.
+    var fade_alpha: ?f32 = null;
+    if (self.controls_fade_start) |fstart| {
+        const el = now -% fstart;
+        if (el >= controls_fade_ms) {
+            self.controls_fade_start = null;
+        } else {
+            const ft = dvui.easing.outQuart(@as(f32, @floatFromInt(el)) / @as(f32, @floatFromInt(controls_fade_ms)));
+            if (ft < 0.5) {
+                fade_alpha = 1.0 - ft * 2.0;
+            } else {
+                // Midpoint commit: whichever direction the fade runs.
+                if (!self.fade_to_controls) {
+                    if (self.hubmode == .controls) self.switchMode(.network, state);
+                } else {
+                    if (self.hubmode == .network) self.switchMode(.controls, state);
+                }
+                fade_alpha = ft * 2.0 - 1.0;
+            }
+        }
+    }
+    const saved_alpha = if (fade_alpha) |a| dvui.alpha(@max(0, a)) else null;
+    defer if (saved_alpha) |sa| dvui.alphaSet(sa);
+
+    switch (self.hubmode) {
+        .clock => {
+            var hover = false;
+            defer self.hub_was_hovered = hover;
+            // Hover state without consuming clicks: position events are
+            // never marked handled, so this scan is invisible to the
+            // widgets below. (The background click itself is evaluated
+            // after tophubBase for the same reason: the player slots
+            // must see button presses first — first handler wins, and
+            // handled/captured events are skipped for later widgets.)
+            {
+                const orect = outer.data().borderRectScale().r;
+                for (dvui.events()) |ev| {
+                    switch (ev.evt) {
+                        .mouse => |me| {
+                            if (me.action == .position and orect.contains(me.p)) hover = true;
+                        },
+                        else => {},
+                    }
+                }
+            }
+            if (hover and !self.hub_was_hovered) {
+                dvui.animation(outer.data().id, "hover", .{
+                    .easing = dvui.easing.outExpo,
+                    .end_time = @floor(std.time.us_per_s * 0.2),
+                });
+            }
+            if (!hover and self.hub_was_hovered) {
+                dvui.animation(outer.data().id, "hover", .{
+                    .easing = dvui.easing.outExpo,
+                    .end_time = @floor(std.time.us_per_s * 0.2),
+                    .start_val = 1.0,
+                    .end_val = 0.0,
+                });
+            }
+
+            if (dvui.animationGet(outer.data().id, "hover")) |a| {
+                outer.data().options.color_fill = base.lighten(10 * a.value());
+                outer.data().options.color_border = .transparent;
+                outer.drawBackground();
+            } else if (hover) {
+                outer.data().options.color_fill = base.lighten(10);
+                outer.data().options.color_border = .transparent;
+                outer.drawBackground();
+            }
+
+            // Shared top strip (clock, plus the player beside it while a
+            // track is active): one function renders it identically in
+            // the clock pill and the control-center header. The player
+            // slots handle their clicks here, before the background
+            // check below — so button presses never fall through.
+            const show_player = self.tophubBase(state, t, 0);
+            if (!show_player) {
+                var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                    .expand = .horizontal,
+                    .tag = "launcher_row",
+                });
+                defer row.deinit();
+                // Single button in a horizontal box packs left (gravity
+                // defaults to 0.0): spacers on both sides center it.
+                _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+                if (dvui.button(@src(), "Launcher  \u{2318}P / /", .{}, .{ .min_size_content = .{ .h = 18 } })) {
+                    self.switchMode(.launcher, state);
+                }
+                _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+            }
+            // Background click opens the control center — evaluated last,
+            // so presses the player slots already handled (and captured)
+            // are skipped here. The media_clicked veto covers the rest.
+            const clicked = dvui.clicked(outer.data(), .{
+                .hovered = &hover,
+                .hover_cursor = .arrow,
+            });
+            if (clicked and !self.media_clicked) self.handleClockClick(state);
+        },
+        .windows => {
+            const list = dvui.flexbox(
+                @src(),
+                .{ .justify_content = .center },
+                .{
+                    .background = false,
+                    .expand = .both,
+                },
+            );
+            defer list.deinit();
+
+            for (dvui.events()) |ev| {
+                if (ev.evt != .key) continue;
+                const k = ev.evt.key;
+                const action: KeyAction = switch (k.action) {
+                    .down => .down,
+                    .up => .up,
+                    else => .repeat,
+                };
+                if (self.handleWindowsKey(k.code, action, state)) break;
+            }
+            if (self.selected >= state.windows.len) self.selectIndex(state, self.selected);
+
+            var focused_idx: ?usize = null;
+            var hovered_idx: ?usize = null;
+            for (state.windows, 0..) |w, i| {
+                const c = if (i == self.selected)
+                    base.lighten(10.0)
+                else if (w.focused)
+                    t.color(.highlight, .fill).lighten(-15.0)
+                else
+                    base;
+                var btn: dvui.ButtonWidget = undefined;
+                btn.init(@src(), .{}, .{
+                    .color_fill = c,
+                    .expand = .ratio,
+                    .max_size_content = .{ .w = 100, .h = 100 },
+                    .min_size_content = .{ .w = 60, .h = 60 },
+                    .id_extra = i,
+                });
+                btn.processEvents();
+                btn.drawBackground();
+                defer btn.deinit();
+                if (btn.focused()) {
+                    focused_idx = i;
+                }
+                if (btn.hovered()) {
+                    hovered_idx = i;
+                }
+                if (self.windows_need_focus and i == self.selected) {
+                    dvui.focusWidget(btn.data().id, null, null);
+                    focused_idx = i;
+                }
+                if (btn.clicked()) {
+                    self.switcher_pending = false;
+                    state.focusWindow(w.id);
+                    // Names its own focus target (see switchMode).
+                    self.suppress_clock_push = true;
+                    self.switchMode(.clock, state);
+                    self.selectIndex(state, 0);
+                }
+                var box = dvui.box(
+                    @src(),
+                    .{ .dir = .vertical, .equal_space = true },
+                    .{
+                        .background = false,
+                        .expand = .both,
+                    },
+                );
+                defer box.deinit();
+                if (state.windowImage(w.id)) |src| {
+                    _ = dvui.image(@src(), .{
+                        .shrink = .ratio,
+                        .source = src,
+                    }, .{
+                        .expand = .both,
+                        .padding = .{ .y = 10 },
+                        .gravity_x = 0.5,
+                    });
+                } else {
+                    // Aliased placeholder: 1-bit raster shown 1:1.
+                    if (Icons.iconPx(.photo, 64, .white) catch null) |crisp| {
+                        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                            .expand = .both,
+                            .padding = .{ .y = 10 },
+                            .gravity_x = 0.5,
+                        });
+                    }
+                }
+                dvui.labelNoFmt(@src(), w.title, .{
+                    .align_x = 0.5,
+                    .align_y = 0.5,
+                }, .{
+                    .font = t.font_title,
+                    .expand = .horizontal,
+                });
+            }
+            self.windows_need_focus = false;
+            if (focused_idx) |f| {
+                self.selectIndex(state, f);
+            } else if (hovered_idx) |h| {
+                self.selectIndex(state, h);
+            }
+        },
+        .launcher => {
+            var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{
+                .expand = .both,
+                .background = false,
+                .padding = .all(4),
+            });
+            defer vbox.deinit();
+
+            const q = blk: {
+                var te = dvui.textEntry(@src(), .{
+                    .placeholder = "Search...",
+                }, .{
+                    .expand = .horizontal,
+                    .margin = .all(2),
+                    .padding = .{ .w = 4, .h = 6, .y = 6, .x = 4 },
+                });
+                defer te.deinit();
+                if (self.launcher_need_focus and self.hubFocused()) {
+                    dvui.focusWidget(te.data().id, null, null);
+                    self.launcher_need_focus = false;
+                }
+                break :blk te.getText();
+            };
+            self.launcher_query = q;
+
+            const results = state.launcher.search(q);
+
+            for (dvui.events()) |ev| {
+                if (ev.evt != .key) continue;
+                const k = ev.evt.key;
+                const action: KeyAction = switch (k.action) {
+                    .down => .down,
+                    .up => .up,
+                    else => .repeat,
+                };
+                if (self.handleLauncherKey(k.code, action, state)) break;
+            }
+
+            var scroll = dvui.scrollArea(@src(), .{}, .{
+                .expand = .both,
+                .background = false,
+                .padding = .all(2),
+                .margin = .{ .y = 6 },
+            });
+            defer scroll.deinit();
+
+            if (results) |apps| {
+                if (apps.len == 0) {
+                    if (q.len == 0) {
+                        dvui.labelNoFmt(@src(), "No apps loaded", .{
+                            .align_x = 0.5,
+                            .align_y = 0.5,
+                        }, .{
+                            .color_text = t.color(.content, .text).opacity(0.6),
+                            .expand = .horizontal,
+                            .margin = .{ .y = 26 },
+                        });
+                    } else {
+                        dvui.labelNoFmt(@src(), "No results", .{
+                            .align_x = 0.5,
+                            .align_y = 0.5,
+                        }, .{
+                            .color_text = t.color(.content, .text).opacity(0.6),
+                            .expand = .horizontal,
+                            .margin = .{ .y = 26 },
+                        });
+                    }
+                } else {
+                    for (apps, 0..) |app, i| {
+                        var btn: dvui.ButtonWidget = undefined;
+                        btn.init(@src(), .{}, .{
+                            .expand = .horizontal,
+                            .background = true,
+                            .color_fill = if (i == 0) base.lighten(5) else base,
+                            .color_fill_hover = base.lighten(5),
+                            .border = .all(1),
+                            .color_border = t.color(.content, .text).opacity(0.08),
+                            .corners = .all(6),
+                            .padding = .all(6),
+                            .margin = .{ .y = 2, .x = 2 },
+                            .id_extra = i,
+                        });
+                        btn.processEvents();
+                        btn.drawBackground();
+                        defer btn.deinit();
+                        if (btn.clicked()) {
+                            var idx: usize = 0;
+                            for (state.launcher.data.items, 0..) |*a, j| if (a == app) {
+                                idx = j;
+                                break;
+                            };
+                            state.launcher.run(idx);
+                            // Running an app ends the session regardless of
+                            // origin (focus goes to the new app).
+                            self.switchMode(.clock, state);
+                        }
+                        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                            .expand = .horizontal,
+                            .background = false,
+                            .min_size_content = .{ .h = 36, .w = 0 },
+                            .max_size_content = .height(36),
+                        });
+                        defer hbox.deinit();
+                        {
+                            var slot = dvui.box(@src(), .{}, .{
+                                .expand = .none,
+                                .min_size_content = .{ .w = 32, .h = 32 },
+                                .max_size_content = .{ .w = 32, .h = 32 },
+                                .gravity_y = 0.5,
+                                .padding = .all(2),
+                            });
+                            defer slot.deinit();
+                            const prev_clip = dvui.clip(slot.data().rectScale().r);
+                            defer dvui.clipSet(prev_clip);
+                            if (app.iconTvg(&state.launcher)) |tvg| {
+                                _ = dvui.icon(@src(), "app", tvg, .{}, .{
+                                    .expand = .none,
+                                    .min_size_content = .{ .w = 28, .h = 28 },
+                                    .max_size_content = .{ .w = 28, .h = 28 },
+                                    .gravity_x = 0.5,
+                                    .gravity_y = 0.5,
+                                });
+                            } else if (app.iconImage(&state.launcher)) |src| {
+                                _ = dvui.image(@src(), .{ .source = src, .shrink = .ratio }, .{
+                                    .expand = .none,
+                                    .min_size_content = .{ .w = 28, .h = 28 },
+                                    .max_size_content = .{ .w = 28, .h = 28 },
+                                    .gravity_x = 0.5,
+                                    .gravity_y = 0.5,
+                                });
+                            } else {
+                                // Aliased fallback: chunky pixels (raster
+                                // 14, shown 28 with nearest sampling).
+                                if (Icons.iconChunkyPx(.photo, 28, .white) catch null) |crisp| {
+                                    _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                        .expand = .none,
+                                        .min_size_content = .{ .w = 28, .h = 28 },
+                                        .gravity_x = 0.5,
+                                        .gravity_y = 0.5,
+                                    });
+                                }
+                            }
+                        }
+                        var row2 = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .background = false, .gravity_y = 0.5, .padding = .{ .x = 6 } });
+                        defer row2.deinit();
+                        dvui.labelNoFmt(@src(), app.name, .{}, .{ .font = t.font_title.withSize(12) });
+                        var meta = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .background = false });
+                        defer meta.deinit();
+                        if (app.comment) |c| {
+                            dvui.labelNoFmt(@src(), c, .{}, .{ .font = t.font_body.withSize(10), .color_text = t.color(.content, .text).opacity(0.6) });
+                        } else if (app.generic_name) |g| {
+                            dvui.labelNoFmt(@src(), g, .{}, .{ .font = t.font_body.withSize(10), .color_text = t.color(.content, .text).opacity(0.6) });
+                        }
+                        if (app.categories) |cats| {
+                            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+                            dvui.labelNoFmt(@src(), cats, .{}, .{ .font = t.font_body.withSize(9), .color_text = t.color(.highlight, .fill) });
+                        }
+                        if (app.exec) |e| {
+                            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+                            dvui.labelNoFmt(@src(), e, .{}, .{ .font = t.font_mono.withSize(9), .color_text = t.color(.content, .text).opacity(0.45) });
+                        }
+                    }
+                }
+            } else {
+                dvui.labelNoFmt(@src(), "No results found", .{
+                    .align_x = 0.5,
+                    .align_y = 0.5,
+                }, .{
+                    .color_text = t.color(.content, .text).opacity(0.6),
+                    .margin = .{ .y = 26 },
+                    .expand = .horizontal,
+                });
+            }
+        },
+        .network => {
+            var snap = state.net.snapshotCopy(state.alloc);
+            // Per-frame copy on the GPA: must free before leaving the
+            // branch or the open panel leaks every frame.
+            defer snap.deinit(state.alloc);
+            // Wifi device path for connect calls (owned, one fetch per
+            // frame shared by all rows).
+            const wifi_dev = state.net.wifiDevicePath();
+            defer if (wifi_dev) |d| state.alloc.free(d);
+            // Settle any in-flight connect/disconnect: success collapses
+            // the row, failure leaves the daemon's last_error under the
+            // targeted row (net_req_ap survives for that).
+            if (self.net_req) |req| {
+                switch (req.poll(&state.net)) {
+                    .pending => {},
+                    .ok => {
+                        self.net_req = null;
+                        self.net_req_ap = 0;
+                        self.net_sel_open = false;
+                    },
+                    .failed => {
+                        const failed_ap = self.net_req_ap;
+                        self.net_req = null;
+                        // Fresh error: restart the flash + 5s dismiss clock.
+                        self.net_err_frame = 0;
+                        self.net_err_since = now;
+                        // Wrong password (or saved-profile auth reject):
+                        // wiggle + red outline on the failed row's entry.
+                        self.net_reject_since = now;
+                        self.net_reject_ap = failed_ap;
+                    },
+                }
+            }
+            // Last frame's typing state fed a row2 highlight that is gone
+            // (focus now shows only via the entry's own focus border);
+            // net_typing/net_typing_since retired with it.
+            // Key handling mirrors launcher/windows: the same helpers the
+            // headless harness drives. Escape dismisses to clock.
+            for (dvui.events()) |ev| {
+                if (ev.evt != .key) continue;
+                const k = ev.evt.key;
+                const action: KeyAction = switch (k.action) {
+                    .down => .down,
+                    .up => .up,
+                    else => .repeat,
+                };
+                if (self.handleNetworkKey(k.code, action, state)) break;
+            }
+            {
+                var row = dvui.box(@src(), .{ .dir = .vertical }, .{
+                    .expand = .both,
+                    .padding = .all(6),
+                });
+                defer row.deinit();
+                var q: []const u8 = "";
+                {
+                    // Panel header, 52 tall: optional back button (tophub
+                    // origin only), then a padded expanding box holding
+                    // the wifi/bluetooth tabs and the enable toggle. Tab
+                    // pills expand in both directions, the enable toggle
+                    // expands vertically; the search entry sits
+                    // full-width directly underneath. All colors come
+                    // from the dvui theme.
+                    var header = dvui.box(@src(), .{
+                        .dir = .horizontal,
+                    }, .{
+                        .expand = .horizontal,
+                        .margin = .{ .h = 6 },
+                    });
+                    defer header.deinit();
+                    if (self.menu_origin != null) {
+                        var back: dvui.ButtonWidget = undefined;
+                        back.init(@src(), .{
+                            .draw_focus = false,
+                        }, .{
+                            .min_size_content = .{ .w = 46, .h = 46 },
+                            .max_size_content = .{ .w = 46, .h = 46 },
+                            .gravity_y = 0.5,
+                            .margin = .{ .x = 0, .y = 0, .w = 6, .h = 0 },
+                            .padding = .all(2),
+                            .background = true,
+                            .color_fill = t.color(.content, .fill).lighten(10),
+                            .color_fill_hover = t.color(.content, .fill).lighten(15),
+                            .color_fill_press = t.color(.content, .fill).lighten(5),
+                            .corners = .all(10),
+                        });
+                        back.processEvents();
+                        back.drawBackground();
+                        if (Icons.iconPx(.chevron_left, 20, t.color(.content, .text).lerp(t.color(.highlight, .fill), 0.25)) catch null) |crisp| {
+                            _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                .gravity_x = 0.5,
+                                .gravity_y = 0.5,
+                                .min_size_content = .{ .w = 20, .h = 20 },
+                                .max_size_content = .{ .w = 20, .h = 20 },
+                                .expand = .none,
+                            });
+                        }
+                        if (back.clicked()) {
+                            // Back rides the close fade to the control
+                            // center; Escape and focus loss go to clock.
+                            self.clearNetSel(state);
+                            self.closeNetworkFaded(state);
+                        }
+                        back.deinit();
+                    }
+                    // Padded box holding the tabs and the enable toggle:
+                    // same height as the back button, expanding to fill
+                    // the row. Tab pills expand in both directions, the
+                    // enable toggle expands vertically.
+                    var tabs = dvui.box(@src(), .{
+                        .dir = .horizontal,
+                    }, .{
+                        .expand = .horizontal,
+                        .min_size_content = .{ .h = 46 },
+                        .max_size_content = dvui.Options.MaxSize.height(46),
+                        .gravity_y = 0.5,
+                        .background = true,
+                        .color_fill = t.color(.content, .fill).lighten(-4),
+                        .corners = .all(10),
+                        .padding = .all(6),
+                    });
+                    defer tabs.deinit();
+                    for ([_]NetTab{ .wifi, .bluetooth }, 0..) |nt, ti| {
+                        const tab_active = self.net_tab == nt;
+                        // Inactive tabs are tinted a little toward the
+                        // accent; the active tab sits on the accent pill.
+                        const tab_ink = if (tab_active)
+                            t.color(.highlight, .text)
+                        else
+                            t.color(.content, .text).lerp(t.color(.highlight, .fill), 0.25);
+                        var tab: dvui.ButtonWidget = undefined;
+                        tab.init(@src(), .{
+                            .draw_focus = false,
+                        }, .{
+                            .id_extra = ti,
+                            .expand = .both,
+                            .background = true,
+                            .color_fill = if (tab_active)
+                                t.color(.highlight, .fill)
+                            else
+                                .transparent,
+                            .color_fill_hover = if (tab_active)
+                                t.color(.highlight, .fill)
+                            else
+                                t.color(.content, .fill).lighten(10),
+                            .color_fill_press = if (tab_active)
+                                t.color(.highlight, .fill).lighten(-5)
+                            else
+                                t.color(.content, .fill).lighten(-5),
+                            .margin = .{ .x = 3, .y = 0, .w = 3, .h = 0 },
+                            .corners = .all(10),
+                            .padding = .{ .x = 6, .y = 6, .w = 6, .h = 6 },
+                        });
+                        tab.processEvents();
+                        tab.drawBackground();
+                        defer tab.deinit();
+                        if (tab.clicked() and !tab_active) {
+                            self.clearNetSel(state);
+                            self.net_tab = nt;
+                            self.net_need_focus = true;
+                        }
+                        var trow = dvui.box(@src(), .{
+                            .dir = .horizontal,
+                        }, .{
+                            .id_extra = ti,
+                            .gravity_x = 0.5,
+                            .gravity_y = 0.5,
+                            .background = false,
+                        });
+                        defer trow.deinit();
+                        if ((if (nt == .wifi)
+                            Icons.iconPx(.wifi, 24, tab_ink)
+                        else
+                            Icons.iconPx(.bluetooth, 24, tab_ink)) catch null) |crisp|
+                        {
+                            _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                .gravity_y = 0.5,
+                                .min_size_content = .{ .w = 24, .h = 24 },
+                                .max_size_content = .{ .w = 24, .h = 24 },
+                            });
+                        }
+                        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+                        dvui.labelNoFmt(@src(), if (nt == .wifi) "Wi-Fi" else "Bluetooth", .{}, .{
+                            .font = t.font_heading.withSize(11),
+                            .color_text = tab_ink,
+                            .gravity_y = 0.5,
+                        });
+                    }
+                    // Enable toggle for the active radio: same height as
+                    // the tab pills, accent when on. Shows the radio
+                    // icon matching the current tab.
+                    const pwr_on = if (self.net_tab == .wifi) snap.wifi_on else snap.bt_powered;
+                    const pwr_ink = if (pwr_on) t.color(.highlight, .text) else t.color(.content, .text).lerp(t.color(.highlight, .fill), 0.25);
+                    var pwr: dvui.ButtonWidget = undefined;
+                    pwr.init(@src(), .{
+                        .draw_focus = false,
+                        .grayed = if (self.net_tab == .wifi) !snap.wifi_supported else !snap.bt_present,
+                    }, .{
+                        .min_size_content = .{ .w = 40 },
+                        .max_size_content = dvui.Options.MaxSize.width(40),
+                        .expand = .vertical,
+                        .gravity_y = 0.5,
+                        .margin = .{ .x = 3, .y = 0, .w = 3, .h = 0 },
+                        .padding = .all(4),
+                        .background = true,
+                        .color_fill = if (pwr_on)
+                            t.color(.highlight, .fill)
+                        else
+                            t.color(.content, .fill).lighten(-4),
+                        .color_fill_hover = if (pwr_on)
+                            t.color(.highlight, .fill).lighten(5)
+                        else
+                            t.color(.content, .fill).lighten(5),
+                        .color_fill_press = if (pwr_on)
+                            t.color(.highlight, .fill).lighten(-5)
+                        else
+                            t.color(.content, .fill).lighten(-8),
+                        .corners = .all(10),
+                    });
+                    pwr.processEvents();
+                    pwr.drawBackground();
+                    if ((if (self.net_tab == .wifi)
+                        Icons.iconPx(.wifi, 36, pwr_ink)
+                    else
+                        Icons.iconPx(.bluetooth, 36, pwr_ink)) catch null) |crisp|
+                    {
+                        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                            .gravity_x = 0.5,
+                            .gravity_y = 0.5,
+                            .expand = .none,
+                        });
+                    }
+                    if (pwr.clicked()) {
+                        if (self.net_tab == .wifi) {
+                            _ = state.net.setWifiEnabled(!snap.wifi_on);
+                        } else {
+                            _ = state.net.setBluetoothEnabled(!snap.bt_powered);
+                        }
+                    }
+                    pwr.deinit();
+                }
+                // Search filters the wifi list only; the bluetooth tab
+                // has no search row.
+                if (self.net_tab == .wifi) {
+                    q = blk: {
+                        // Centered search text via our TextEntry copy
+                        // (stock dvui entries are always left/top aligned).
+                        const qbox = AlignedEntry.textEntry(@src(), .{
+                            .placeholder = "Search...",
+                            .align_y = 0.5,
+                        }, .{
+                            .expand = .horizontal,
+                            .min_size_content = .{ .h = 28 },
+                            .font = t.font_body.withSize(11.0),
+                            .margin = .{ .h = 8 },
+                        });
+                        defer qbox.deinit();
+                        if (self.net_need_focus and self.hubFocused()) {
+                            dvui.focusWidget(qbox.data().id, null, null);
+                            self.net_need_focus = false;
+                        }
+                        break :blk qbox.getText();
+                    };
+                    // Live filter: the worker applies this to snap.aps on every
+                    // snapshot; empty clears the filter. setSearch is a no-op
+                    // when the query is unchanged, so calling it per frame is
+                    // free.
+                    state.net.setSearch(q);
+                }
+                if (self.net_tab == .wifi) {
+                    if (snap.aps.len == 0) {
+                        dvui.labelNoFmt(@src(), if (q.len == 0) "No networks found" else "No networks match", .{
+                            .align_x = 0.5,
+                            .align_y = 0.5,
+                        }, .{
+                            .color_text = t.color(.content, .text).opacity(0.6),
+                            .expand = .horizontal,
+                            .gravity_y = 0.5,
+                            .margin = .{ .y = 26 },
+                        });
+                    }
+                } else if (!snap.bt_present) {
+                    dvui.labelNoFmt(@src(), "No Bluetooth adapter", .{
+                        .align_x = 0.5,
+                        .align_y = 0.5,
+                    }, .{
+                        .color_text = t.color(.content, .text).opacity(0.6),
+                        .expand = .horizontal,
+                        .gravity_y = 0.5,
+                        .margin = .{ .y = 26 },
+                    });
+                } else if (snap.bt_devices.len == 0) {
+                    dvui.labelNoFmt(@src(), if (!snap.bt_powered) "Bluetooth is off" else "No devices found", .{
+                        .align_x = 0.5,
+                        .align_y = 0.5,
+                    }, .{
+                        .color_text = t.color(.content, .text).opacity(0.6),
+                        .expand = .horizontal,
+                        .gravity_y = 0.5,
+                        .margin = .{ .y = 26 },
+                    });
+                }
+                {
+                    var scroll = dvui.scrollArea(@src(), .{
+                        .vertical = .auto,
+                        .vertical_bar = .auto,
+                        .horizontal = .none,
+                    }, .{
+                        // Fill the panel: without this the content sizes
+                        // to the widest row and nothing spans the viewport.
+                        .expand = .both,
+                    });
+                    defer scroll.deinit();
+                    // Steady-timer inputs, accumulated across rows below:
+                    // a spinner needs fast frames to turn, a visible error
+                    // needs them to flash; otherwise the 750ms state cadence
+                    // is enough.
+                    var net_busy = false;
+                    var net_err_visible = false;
+                    // Tab body: the wifi AP rows below keep their
+                    // historical indent; bluetooth device rows follow in
+                    // the else.
+                    if (self.net_tab == .wifi) {
+                        for (snap.aps) |conn| {
+                            const selected = if (self.net_sel) |s|
+                                (s == conn.id)
+                            else
+                                (snap.connected == conn.id);
+                            const open = selected and self.net_sel_open;
+                            // Highlight marks the joined network only, dimmed
+                            // 10%; everything else is the plain content fill
+                            // with standard hover/press offsets.
+                            const is_connected = snap.connected != 0 and snap.connected == conn.id;
+                            const base_fill = if (is_connected)
+                                t.color(.highlight, .fill).lighten(-10)
+                            else
+                                t.color(.content, .fill);
+                            // In-flight request for this row (drives spinner,
+                            // button state; settled at the branch top).
+                            const connecting = self.net_req != null and self.net_req_ap == conn.id and
+                                self.net_req.?.isPending(&state.net);
+                            // The row auto-sizes around its content. While the
+                            // resize animation runs for this row, pin to the
+                            // animated height instead (height only: pinning the
+                            // width blows out the scroll content extents and the
+                            // rows jump horizontally for the whole animation).
+                            // The error banner below lives inside this box and
+                            // adds a line past the 72px open budget, so an
+                            // erroring row is never pinned (it would clip).
+                            const show_err = open and self.net_req == null and self.net_req_ap == conn.id and
+                                snap.last_error.len > 0 and now -% self.net_err_since < 5000;
+                            net_busy = net_busy or connecting;
+                            net_err_visible = net_err_visible or show_err;
+                            const anim_live = now -% self.net_anim_start < net_anim_ms;
+                            const anim_mine = anim_live and !show_err and (if (open)
+                                self.net_anim_open_ap == null or conn.id != self.net_anim_open_ap.?
+                            else
+                                self.net_anim_open_ap != null and conn.id == self.net_anim_open_ap.?);
+                            var bopts: dvui.Options = .{
+                                .background = true,
+                                .color_fill = base_fill,
+                                .color_fill_hover = base_fill.lighten(10),
+                                .color_fill_press = base_fill.lighten(-5),
+                                .corners = .all(10),
+                                .expand = .horizontal,
+                                // Rect fields are left/top/right/bottom.
+                                .padding = .{ .x = 4, .y = 6, .w = 4, .h = 6 },
+                                // Stable per-connection id (not the loop index):
+                                // the list re-sorts as strengths change, and
+                                // index-keyed widget ids make per-widget data
+                                // (including the password buffer) jump rows.
+                                .id_extra = @as(usize, @truncate(conn.id)),
+                            };
+                            if (anim_mine) {
+                                const ah = self.netRowHeight(conn.id, open, now);
+                                bopts.min_size_content = .{ .h = ah };
+                                bopts.max_size_content = dvui.Options.MaxSize.height(ah);
+                            }
+                            const box = dvui.box(@src(), .{ .dir = .vertical }, bopts);
+                            defer box.deinit();
+                            // Header: wifi + text lined up on the left, lock hard
+                            // right. Identical in both states so expanding never
+                            // moves it. The signal glyph sits on the bottom edge
+                            // (row1 is taller than the glyphs) so weaker signals
+                            // read as lower, not just smaller.
+                            {
+                                var row1 = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                                    .expand = .horizontal,
+                                    .background = false,
+                                    .min_size_content = .{ .h = 32 },
+                                    .id_extra = @as(usize, @truncate(conn.id)),
+                                });
+                                defer row1.deinit();
+                                // One comptime call per icon (tabler embeds only
+                                // referenced icons). Aliased 1-bit raster, shown 1:1.
+                                const sig_crisp: ?Icons.Crisp = switch (State.Net.barsForStrength(conn.strength)) {
+                                    0 => Icons.iconPx(.wifi_off, 24, .white) catch null,
+                                    1 => Icons.iconPx(.wifi_0, 24, .white) catch null,
+                                    2 => Icons.iconPx(.wifi_1, 24, .white) catch null,
+                                    3 => Icons.iconPx(.wifi_2, 24, .white) catch null,
+                                    else => Icons.iconPx(.wifi, 24, .white) catch null,
+                                };
+                                if (sig_crisp) |crisp| {
+                                    _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                        .padding = .all(2),
+                                        .gravity_y = 1.0,
+                                    });
+                                }
+                                // NOTE: no align_y — single-line labels render at
+                                // the top of their content rect (LabelWidget
+                                // places only horizontally), so vertical
+                                // centering comes from the widget's own gravity
+                                // + symmetric padding. Horizontal-only expand
+                                // keeps the content box text-sized (and pushes
+                                // the lock right); .both would stretch it full
+                                // height and strand the text at the top.
+                                dvui.labelNoFmt(@src(), conn.ssid, .{}, .{
+                                    .expand = .horizontal,
+                                    .padding = .all(4),
+                                    .gravity_y = 0.5,
+                                });
+                                // Linked to this AP but no internet behind
+                                // it: yellow alert next to the name (same
+                                // state as the yellowed bar/card wifi
+                                // icons); hovering explains.
+                                if (is_connected and !State.Net.online(snap.connectivity)) {
+                                    if (Icons.iconPx(.alert_small, 18, dvui.Color.yellow) catch null) |alert| {
+                                        const aw = dvui.image(@src(), Icons.pixelImage(alert), .{
+                                            .gravity_y = 0.5,
+                                            .min_size_content = .{ .w = 18, .h = 18 },
+                                            .max_size_content = .{ .w = 18, .h = 18 },
+                                            .id_extra = @as(usize, @truncate(conn.id)),
+                                        });
+                                        dvui.tooltip(@src(), .{ .active_rect = aw.borderRectScale().r }, "connected with no internet", .{}, .{});
+                                    }
+                                }
+                                //macOS-style activity spinner while this row has
+                                // a request in flight. Drawn manually (dvui's
+                                // stock spinner is an arc, not spokes).
+                                if (connecting) {
+                                    var slot = dvui.box(@src(), .{}, .{
+                                        .background = false,
+                                        .min_size_content = .{ .w = 24, .h = 24 },
+                                        .max_size_content = .{ .w = 24, .h = 24 },
+                                        .padding = .all(2),
+                                        .gravity_y = 0.5,
+                                        .id_extra = @as(usize, @truncate(conn.id)),
+                                    });
+                                    defer slot.deinit();
+                                    drawSpinner(slot.data().contentRectScale(), now, t.color(.content, .text));
+                                }
+                                // Same 2px padding as the signal icon so the
+                                // text sits equidistant from both glyphs.
+                                if (conn.secured) {
+                                    if (Icons.iconPxFilled(.lock, 24, .white) catch null) |crisp| {
+                                        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                            .padding = .all(2),
+                                            .gravity_y = 0.5,
+                                        });
+                                    }
+                                } else {
+                                    if (Icons.iconPx(.lock_cancel, 24, .white) catch null) |crisp| {
+                                        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                            .padding = .all(2),
+                                            .gravity_y = 0.5,
+                                        });
+                                    }
+                                }
+                            }
+                            // Interactive child rects, for the whole-row toggle
+                            // veto below. Physical units, matching the click
+                            // position. Captured before their widgets deinit.
+                            // The button vetoes via its own click state.
+                            var veto_entry: ?dvui.Rect.Physical = null;
+                            var veto_err: ?dvui.Rect.Physical = null;
+                            var btn_clicked = false;
+                            if (open) {
+                                // Joined to this network: offer Disconnect.
+                                // Otherwise Connect — activating a new
+                                // connection swaps out whatever is active on
+                                // the device, no manual disconnect needed.
+                                const joined_here = is_connected;
+                                // Controls row. No background wash while typing:
+                                // the entry's own focus outline is the only
+                                // focus indicator (the old highlight fill made
+                                // the whole row turn the theme highlight color).
+                                var row2 = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                                    .expand = .horizontal,
+                                    .background = false,
+                                    .id_extra = @as(usize, @truncate(conn.id)),
+                                    .tag = "pw_row",
+                                });
+                                defer row2.deinit();
+                                // Entry outlives the row: its buffer backs `pw`
+                                // through the Connect click below.
+                                var pw: []const u8 = "";
+                                // Saved-profile state: a stored NM password
+                                // exists and the user hasn't typed an
+                                // override. Entry grays out ("Password saved
+                                // — click Connect"); Connect activates the
+                                // stored profile. Any typed text overrides.
+                                const reject_ap = self.net_reject_ap;
+                                const reject_live = reject_ap == conn.id and
+                                    now -% self.net_reject_since < net_reject_ms and
+                                    self.net_reject_since != 0;
+                                if (reject_live) std.debug.print("reject_live row {d} el={d}\n", .{ conn.id, now -% self.net_reject_since });
+                                if (conn.secured and !joined_here) {
+                                    const use_saved = conn.saved;
+                                    var eopts: dvui.Options = .{
+                                        .expand = .horizontal,
+                                        .gravity_y = 0.5,
+                                        .font = t.font_body.withSize(11.0),
+                                        // Uncap the single-line width clamp
+                                        // (min 14 M-widths) so the entry truly
+                                        // fills its flex share. min h 14 lands
+                                        // the entry on the 28px control budget
+                                        // (14 content + 12 padding + 2 border),
+                                        // matching the button below so the open
+                                        // row measures exactly net_row_open_h.
+                                        // No vertical margin: the default all(4)
+                                        // would pad the row height; 8px right
+                                        // keeps it off the button.
+                                        .min_size_content = .{ .h = 14 },
+                                        .max_size_content = .{ .w = 100000, .h = 14 },
+                                        .margin = .{ .x = 0, .y = 0, .w = 8, .h = 0 },
+                                        .id_extra = @as(usize, @truncate(conn.id)),
+                                        .tag = "pw_entry",
+                                    };
+                                    if (use_saved) {
+                                        // Grayed look: dimmed chrome and text.
+                                        // Still interactive — typing an
+                                        // override switches the row back to
+                                        // the typed-password connect path.
+                                        eopts = eopts.override(.{
+                                            .color_fill = t.color(.content, .fill).opacity(0.45),
+                                            .color_border = t.color(.content, .text).opacity(0.2),
+                                            .color_text = t.color(.content, .text).opacity(0.55),
+                                        });
+                                    }
+                                    if (reject_live) {
+                                        // Wrong-password wiggle: the left
+                                        // margin follows a decaying sine
+                                        // (always >= 0: box margins can't go
+                                        // negative), so entry+button glide
+                                        // together within the row's own width
+                                        // and the flex share is preserved.
+                                        const el = @as(f32, @floatFromInt(now -% self.net_reject_since));
+                                        const frac = el / @as(f32, @floatFromInt(net_reject_ms));
+                                        const decay = 1.0 - frac;
+                                        const dx = (@sin(frac * std.math.pi * 6.0) + 1.0) * 5.0 * decay;
+                                        eopts = eopts.override(.{
+                                            .margin = .{ .x = dx, .y = 0, .w = 8, .h = 0 },
+                                        });
+                                    }
+                                    const e = dvui.textEntry(@src(), .{
+                                        .placeholder = if (use_saved)
+                                            "Password saved — click Connect"
+                                        else
+                                            "Password",
+                                        .password_char = "*",
+                                    }, eopts);
+                                    pw = e.getText();
+                                    veto_entry = e.data().borderRectScale().r;
+                                    // Enter submits like the button. The flag
+                                    // latches until read, so always clear it.
+                                    const enter_go = e.enter_pressed;
+                                    e.enter_pressed = false;
+                                    // Deinit BEFORE creating the Connect button:
+                                    // the entry's init leaves dvui's current
+                                    // parent at its internal textLayout, so any
+                                    // widget created before deinit becomes a
+                                    // child of the entry and renders on top of
+                                    // the password text (the "goofy" overlap).
+                                    // getText's buffer stays valid after
+                                    // deinit; pw was already copied above.
+                                    const pw_owned = pw;
+                                    const entry_rect = e.data().borderRectScale();
+                                    const entry_focused = dvui.focusedWidgetId() == e.data().id;
+                                    e.deinit();
+                                    pw = pw_owned;
+                                    // Reject window: draw the red focus outline
+                                    // over the stock one (same 2px), tied to
+                                    // focus like the stock border so it reads
+                                    // as the entry's outline, not a decal.
+                                    if (reject_live and entry_focused) {
+                                        entry_rect.r.stroke(dvui.CornerRect.Physical.all(4 * entry_rect.s), .{
+                                            .thickness = 2 * entry_rect.s,
+                                            .color = .{ .r = 0xcc, .g = 0x2e, .b = 0x2e, .a = 255 },
+                                            .after = true,
+                                        });
+                                    }
+                                    if (enter_go and !connecting) {
+                                        if (pw.len > 0) {
+                                            if (wifi_dev) |dev| self.connectToAp(state, dev, conn, pw);
+                                        } else if (use_saved) {
+                                            if (wifi_dev) |dev| self.connectToApSaved(state, dev, conn);
+                                        }
+                                    }
+                                } else {
+                                    _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+                                }
+                                // While the request is in flight the button
+                                // itself reports it: grayed "Connecting…".
+                                // Standard button at the row end (right).
+                                const btn_label = if (connecting) "Connecting…" else if (joined_here) "Disconnect" else "Connect";
+                                // A secured network needs a passphrase unless
+                                // one is already stored (saved-profile path).
+                                const need_pw = conn.secured and !joined_here and pw.len == 0 and !conn.saved;
+                                btn_clicked = dvui.button(@src(), btn_label, .{ .grayed = need_pw or connecting }, .{
+                                    .gravity_y = 0.5,
+                                    // 24 content + 4 padding = the 28px control
+                                    // budget (see the password entry above): the
+                                    // open row then measures exactly
+                                    // net_row_open_h and the resize pin neither
+                                    // clips nor jumps at either end.
+                                    .min_size_content = .{ .h = 24 },
+                                    // Zero vertical chrome: the defaults
+                                    // (margin + padding all(4..6)) stack onto
+                                    // the label and bloat the row with dead
+                                    // space below the button.
+                                    .margin = .all(0),
+                                    .padding = .all(2),
+                                    .font = t.font_body.withSize(11.0),
+                                    .id_extra = @as(usize, @truncate(conn.id)),
+                                    .tag = "connect_btn",
+                                });
+                                // grayed is visual only: guard the in-flight
+                                // double-submit explicitly.
+                                if (btn_clicked and !connecting) {
+                                    if (joined_here) {
+                                        self.disconnectAp(state, conn);
+                                    } else if (pw.len > 0) {
+                                        // Typed text always overrides the
+                                        // stored secret.
+                                        if (wifi_dev) |dev| self.connectToAp(state, dev, conn, pw);
+                                    } else if (conn.saved) {
+                                        // Nothing typed + stored profile: let
+                                        // NM supply the saved password.
+                                        if (wifi_dev) |dev| self.connectToApSaved(state, dev, conn);
+                                    }
+                                }
+                            }
+                            // Error for this row's failed request, on its own
+                            // line below the controls. Flashes red twice (10
+                            // frame periods: 5 red, 5 transparent), then goes
+                            // unadorned; vanishes 5s after the failure unless
+                            // hovered (hover restarts the 5s), or at once on
+                            // click. Clicking it must not toggle the row.
+                            if (show_err) {
+                                self.net_err_frame += 1;
+                                var errbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                                    .expand = .horizontal,
+                                    .background = true,
+                                    .color_fill = if (errFlashRed(self.net_err_frame))
+                                        dvui.Color{ .r = 0xcc, .g = 0x2e, .b = 0x2e, .a = 255 }
+                                    else
+                                        .transparent,
+                                    .corners = .all(4),
+                                    .padding = .all(4),
+                                    .id_extra = @as(usize, @truncate(conn.id)),
+                                });
+                                defer errbox.deinit();
+                                var err_hover = false;
+                                const err_clicked = dvui.clicked(errbox.data(), .{ .hovered = &err_hover });
+                                if (err_hover) self.net_err_since = now;
+                                if (err_clicked) {
+                                    self.net_req_ap = 0;
+                                } else {
+                                    dvui.labelNoFmt(@src(), snap.last_error, .{}, .{
+                                        .expand = .horizontal,
+                                        .color_text = t.color(.content, .text).opacity(0.85),
+                                        .font = t.font_body.withSize(10.0),
+                                    });
+                                }
+                                veto_err = errbox.data().borderRectScale().r;
+                            }
+                            // The whole row toggles — except clicks the button
+                            // took, and releases landing on the password entry
+                            // or error box, which belong to those widgets.
+                            // Keyboard activation carries no position and
+                            // always toggles.
+                            if (dvui.clickedEx(box.data(), .{})) |cev| {
+                                const on_child = btn_clicked or switch (cev) {
+                                    .mouse => |me| blk: {
+                                        if (veto_entry) |r| {
+                                            if (r.contains(me.p)) break :blk true;
+                                        }
+                                        if (veto_err) |r| {
+                                            if (r.contains(me.p)) break :blk true;
+                                        }
+                                        break :blk false;
+                                    },
+                                    else => false,
+                                };
+                                if (!on_child) {
+                                    // Restart the resize animation from the row
+                                    // currently displayed open (if any), then
+                                    // flip this row's state.
+                                    self.net_anim_open_ap = if (self.net_sel_open) blk: {
+                                        if (self.net_sel) |s| break :blk s;
+                                        break :blk if (snap.connected != 0) snap.connected else null;
+                                    } else null;
+                                    self.net_anim_start = now;
+                                    // Drive frames for the manual height lerp:
+                                    // without a live dvui animation the loop
+                                    // sleeps through the 135ms and both rows
+                                    // snap instead of resizing.
+                                    dvui.animation(self.anim_id, "netrow", .{
+                                        .easing = dvui.easing.outQuart,
+                                        .end_time = net_anim_ms * 1000,
+                                    });
+                                    // Select the connection (expand its row);
+                                    // clicking the selected row collapses it.
+                                    if (self.net_sel == conn.id) {
+                                        self.net_sel_open = !self.net_sel_open;
+                                    } else {
+                                        self.net_sel = conn.id;
+                                        self.net_sel_open = true;
+                                    }
+                                    self.net_req_ap = 0;
+                                }
+                            }
+                        }
+                    } else {
+                        // Bluetooth tab: same card language as the wifi
+                        // rows (icon + name left, status hard right),
+                        // status only — the worker exposes no
+                        // connect/disconnect actions for BT devices.
+                        for (snap.bt_devices, 0..) |dev, di| {
+                            var bbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                                .background = true,
+                                .color_fill = if (dev.connected)
+                                    t.color(.highlight, .fill).lighten(-10)
+                                else
+                                    t.color(.content, .fill),
+                                .corners = .all(10),
+                                .expand = .horizontal,
+                                .padding = .{ .x = 4, .y = 6, .w = 4, .h = 6 },
+                                .min_size_content = .{ .h = 32 },
+                                .id_extra = di,
+                            });
+                            defer bbox.deinit();
+                            if (Icons.iconPx(.bluetooth, 20, .white) catch null) |crisp| {
+                                _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                    .padding = .all(2),
+                                    .gravity_y = 0.5,
+                                    .min_size_content = .{ .w = 20, .h = 20 },
+                                    .max_size_content = .{ .w = 20, .h = 20 },
+                                });
+                            }
+                            dvui.labelNoFmt(@src(), dev.name, .{}, .{
+                                .expand = .horizontal,
+                                .padding = .all(4),
+                                .gravity_y = 0.5,
+                            });
+                            dvui.labelNoFmt(@src(), if (dev.connected)
+                                "Connected"
+                            else if (dev.paired)
+                                "Paired"
+                            else
+                                "Available", .{}, .{
+                                .font = t.font_body.withSize(10),
+                                .color_text = if (dev.connected)
+                                    t.color(.highlight, .fill)
+                                else
+                                    t.color(.content, .text).opacity(0.55),
+                                .gravity_y = 0.5,
+                                .padding = .{ .x = 4 },
+                            });
+                        }
+                    }
+                    // Steady state cadence while the panel is open: re-ask the
+                    // worker for fresh state every State.Net.refresh_ms so the
+                    // rows track the daemon even with no input. The timer is what
+                    // wakes the loop (worker pushes also wake it, for immediacy).
+                    // A spinner or a flashing error needs faster frames than the
+                    // state cadence, so those tick hot — but re-requests stay
+                    // gated on net_last_refresh so fast ticks never turn into a
+                    // D-Bus storm.
+                    {
+                        const tick_us: i32 = if (net_busy or net_err_visible) 80_000 else @intCast(State.Net.refresh_ms * 1000);
+                        if (dvui.timerDone(self.anim_id)) {
+                            if (now -% self.net_last_refresh >= State.Net.refresh_ms) {
+                                self.net_last_refresh = now;
+                                _ = state.net.refresh();
+                            }
+                            dvui.timer(self.anim_id, tick_us);
+                        } else if (dvui.timerGet(self.anim_id) == null) {
+                            dvui.timer(self.anim_id, tick_us);
+                        }
+                    }
+                }
+            }
+            // Dismiss when the focused app window moves elsewhere (MRU
+            // head change vs the open baseline — covers clicks the hub
+            // never sees as focus events). Focus loss and Escape are
+            // updateSwitcher's and handleNetworkKey's jobs; this only
+            // adds the app-switch detector.
+            const focused_elsewhere = state.windows.len > 0 and self.net_open_win != 0 and
+                state.windows[0].id != self.net_open_win;
+            // off_start is stamped with a fresh clock read inside
+            // switchMode, which can run mid-frame (fade midpoint
+            // commit) after `now` was read at frame top — so `now`
+            // can be a tick older. Saturate instead of underflowing.
+            if (saturatingAge(now, self.off_start) > 500 and focused_elsewhere) {
+                self.clearNetSel(state);
+                self.dismissHome(state);
+            }
+        },
+        .controls => {
+            var outer_ = dvui.box(@src(), .{
+                .dir = .vertical,
+            }, .{
+                .expand = .both,
+            });
+            defer outer_.deinit();
+
+            // Escape dismisses the control center itself straight to
+            // clock (it is a direct member, never a child).
+            for (dvui.events()) |ev| {
+                if (ev.evt != .key) continue;
+                const k = ev.evt.key;
+                const action: KeyAction = switch (k.action) {
+                    .down => .down,
+                    .up => .up,
+                    else => .repeat,
+                };
+                if (k.code == .escape and action == .down) {
+                    self.dismissHome(state);
+                    break;
+                }
+            }
+
+            // Attached clock: the whole clock hub (with its player
+            // extension while a track is active) stays on top of the
+            // control center, one panel — the same tophubBase strip as
+            // the clock pill. Sub-panels (network, launcher, switcher)
+            // override entirely — no clock content there.
+            _ = self.tophubBase(state, t, 100);
+
+            {
+                var snap = state.net.snapshotCopy(state.alloc);
+                // Same per-frame copy as the network panel: must free or
+                // the open hub leaks every frame.
+                defer snap.deinit(state.alloc);
+                var net = dvui.box(@src(), .{
+                    .dir = .horizontal,
+                    // Equal slices for both toggles: without this each
+                    // block sizes to its own label ("WiFi" vs
+                    // "Bluetooth") and the pair comes out uneven.
+                    .equal_space = true,
+                }, .{
+                    .expand = .horizontal,
+                    .padding = .all(4),
+                });
+                defer net.deinit();
+
+                // 2 blocks here
+                for (0..2) |i| {
+                    // wifi_on tracks the wifi radio; its bluetooth
+                    // counterpart is bt_powered (BlueZ "Powered":
+                    // on and listening), not bt_present (which only
+                    // means an adapter exists).
+                    const on = if (i == 0) snap.wifi_on else snap.bt_powered;
+                    // Fixed glyph box for both toggles: rasterized at the
+                    // display size and shown 1:1, so wifi and bluetooth
+                    // render at identical sizes (24 content + 12 badge
+                    // padding = a 36px circle).
+                    const glyph_px: f32 = 24;
+                    // Linked but offline: yellow the wifi glyph, matching
+                    // the bar icon and the row alert below.
+                    const no_net = i == 0 and snap.connected != 0 and !State.Net.online(snap.connectivity);
+                    const glyph_tint = if (no_net) dvui.Color.yellow else t.color(.content, .text);
+                    const icon = try if (i == 0)
+                        if (snap.wifi_supported)
+                            Icons.iconPx(.wifi, glyph_px, glyph_tint)
+                        else
+                            Icons.iconPx(.network, glyph_px, t.color(.content, .text))
+                    else
+                        Icons.iconPx(.bluetooth, glyph_px, t.color(.content, .text));
+
+                    // ButtonWidget is an overlay-style container (every
+                    // direct child would fill it), so the row layout
+                    // lives in the inner horizontal box; the button
+                    // itself only carries the card chrome + the click.
+                    var btn: dvui.ButtonWidget = undefined;
+                    btn.init(@src(), .{
+                        .draw_focus = false,
+                    }, .{
+                        .id_extra = i,
+                        .expand = .horizontal,
+                        .padding = .all(8),
+                        .background = true,
+                        .color_fill = t.color(.content, .fill).lighten(5),
+                        .color_fill_hover = t.color(.content, .fill).lighten(10),
+                        .color_fill_press = t.color(.content, .fill).lighten(3),
+                        // Symmetric on all sides: the old right-12/bottom-4
+                        // margins offset each card and broke the pair's
+                        // alignment.
+                        .margin = .{ .x = 4, .y = 0, .w = 4, .h = 0 },
+                        .corners = .all(10),
+                    });
+                    btn.processEvents();
+                    btn.drawBackground();
+                    defer btn.deinit();
+                    // Each toggle opens the panel on its own tab.
+                    if (btn.clicked()) self.openNetworkFaded(state, if (i == 0) .wifi else .bluetooth);
+                    var row = dvui.box(@src(), .{
+                        .dir = .horizontal,
+                    }, .{
+                        .id_extra = i,
+                        .expand = .both,
+                        .background = false,
+                    });
+                    defer row.deinit();
+                    _ = dvui.image(@src(), Icons.pixelImage(icon), .{
+                        .background = true,
+                        .color_fill = if (on)
+                            t.color(.highlight, .fill)
+                        else
+                            t.color(.content, .fill).lighten(-4),
+                        .padding = .all(6),
+                        // circle
+                        .corners = .all(46),
+                        .gravity_y = 0.5,
+                        .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                        .max_size_content = .{ .w = glyph_px, .h = glyph_px },
+                    });
+                    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+                    // Expands to push the chevron hard right; vertical
+                    // centering via gravity (single-line labels render at
+                    // the top of their own box, as in the network rows).
+                    dvui.labelNoFmt(@src(), if (i == 0) "WiFi" else "Bluetooth", .{}, .{
+                        .font = t.font_heading.withSize(10),
+                        .expand = .horizontal,
+                        .gravity_y = 0.5,
+                    });
+                    _ = dvui.image(@src(), Icons.pixelImage(
+                        try Icons.iconPx(.chevron_right, 16, t.color(.content, .text).lighten(-28)),
+                    ), .{
+                        .gravity_y = 0.5,
+                        .min_size_content = .{ .w = 16, .h = 16 },
+                        .max_size_content = .{ .w = 16, .h = 16 },
+                    });
+                }
+            }
+            self.activitySection(state, t);
+        },
+        .search => self.switchMode(.launcher, state),
+    }
+
+    return .ok;
+}
+
+// Control-center activity section: one row per live mic/camera/share
+// stream and download, each with its force-stop. PipeWire streams queue
+// a `pw-cli destroy` on the worker; downloads can't be cancelled from
+// outside the browser, so they get an Open-folder button instead.
+// Renders nothing when idle and no notifications wait.
+fn activitySection(self: *HubUi, state: *State, t: *dvui.Theme) void {
+    _ = self;
+    var act = state.activity.snapshotCopy(state.alloc);
+    defer act.deinit(state.alloc);
+    const n_notif = state.notif.count();
+    if (act.items.len == 0 and n_notif == 0) return;
+
+    var sect = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .horizontal,
+        .background = true,
+        .color_fill = t.color(.content, .fill).lighten(5),
+        .corners = .all(10),
+        .padding = .all(8),
+        .margin = .{ .x = 4, .y = 8, .w = 4, .h = 0 },
+    });
+    defer sect.deinit();
+    dvui.labelNoFmt(@src(), "Activity", .{}, .{
+        .font = t.font_heading.withSize(10),
+        .gravity_x = 0.0,
+    });
+    for (act.items, 0..) |*it, i| {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .background = false,
+            .gravity_y = 0.5,
+            .id_extra = i,
+        });
+        defer row.deinit();
+        const tint: dvui.Color = switch (it.kind) {
+            .record => dvui.Color.red,
+            .share => dvui.Color.green,
+            .mic, .camera => dvui.Color.blue,
+            .download => t.color(.content, .text).lighten(-10),
+        };
+        const crisp: ?Icons.Crisp = switch (it.kind) {
+            .record => Icons.iconPx(.player_record, 20, tint) catch null,
+            .share => Icons.iconPx(.screen_share, 20, tint) catch null,
+            .camera => Icons.iconPx(.camera, 20, tint) catch null,
+            .mic => Icons.iconPx(.microphone, 20, tint) catch null,
+            .download => Icons.iconPx(.download, 20, tint) catch null,
+        };
+        if (crisp) |ci| {
+            _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 20, .h = 20 },
+                .max_size_content = .{ .w = 20, .h = 20 },
+                .id_extra = i,
+            });
+        }
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        dvui.labelNoFmt(@src(), it.label, .{}, .{
+            .font = t.font_body.withSize(11.0),
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+        });
+        if (it.detail.len > 0) {
+            dvui.labelNoFmt(@src(), it.detail, .{}, .{
+                .font = t.font_body.withSize(10.0),
+                .color_text = t.color(.content, .text).opacity(0.6),
+                .gravity_y = 0.5,
+            });
+            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        }
+        switch (it.source) {
+            .pipewire => {
+                if (dvui.button(@src(), "Stop", .{}, .{ .id_extra = i, .gravity_y = 0.5 })) {
+                    state.activity.requestStop(.pipewire, it.stop_id);
+                }
+            },
+            .downloads => {
+                if (dvui.button(@src(), "Open folder", .{}, .{ .id_extra = i, .gravity_y = 0.5 })) {
+                    state.activity.openDownloads();
+                }
+            },
+        }
+    }
+    if (n_notif > 0) {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .background = false,
+            .gravity_y = 0.5,
+        });
+        defer row.deinit();
+        if (Icons.iconPx(.bell, 20, t.color(.content, .text)) catch null) |ci| {
+            _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 20, .h = 20 },
+                .max_size_content = .{ .w = 20, .h = 20 },
+            });
+        }
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        var nbuf: [32]u8 = undefined;
+        const ntxt = std.fmt.bufPrint(&nbuf, "{d} unread", .{n_notif}) catch "?";
+        dvui.labelNoFmt(@src(), ntxt, .{}, .{
+            .font = t.font_body.withSize(11.0),
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+        });
+        if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+            state.notif.clear();
+        }
+    }
+}
+
+// Shared top strip — the whole clock hub as one row: fixed 132px clock
+// column, player extension beside it while a track is active (exactly
+// LeafShell's Clock + MediaPlayer). Rendered identically in the clock
+// pill and on top of the control center, so the two never drift: no
+// call-site container code, just this function. The media snapshot is a
+// per-frame copy on the GPA, owned and freed here (immediate mode: it
+// only has to live for this call). Returns whether the player
+// extension is showing (clock mode shows the launcher row instead when
+// it isn't); media clicks land on HubUi.media_clicked directly.
+// `id_extra` keeps widget ids distinct between the two live contexts
+// (clock pill = 0, control-center header = 100): both live in the hub
+// window, so sharing @src() ids would bleed per-widget state across
+// mode switches.
+pub fn tophubBase(self: *HubUi, state: *State, t: *dvui.Theme, id_extra: usize) bool {
+    // Fresh every frame: a stale true from a clicked-then-closed player
+    // must never veto a later background click.
+    self.media_clicked = false;
+    const media_active = state.media.active();
+    var msnap = if (media_active) state.media.snapshotCopy(state.alloc) else null;
+    defer if (msnap) |*m| m.deinit(state.alloc);
+    const show_player = if (msnap) |*m| m.has_media and m.status != .stopped else false;
+
+    var strip = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .background = false,
+        // 12 units on both horizontal edges; padding (not margin)
+        // shrinks the content box, so dvui clips the title text against
+        // it instead of pushing the fixed-size media buttons out past
+        // the hub edge.
+        .padding = .{ .x = 12, .w = 12 },
+        .id_extra = id_extra,
+        .tag = "tophub",
+    });
+    defer strip.deinit();
+    self.activityStrip(state, id_extra);
+    {
+        var clockbox = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .background = false,
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 132 },
+            .max_size_content = dvui.Options.MaxSize.width(132),
+            .id_extra = id_extra,
+            .tag = "tophub_clock",
+        });
+        defer clockbox.deinit();
+        // Playing: LeafShell left-aligns the clock beside the player;
+        // stopped/idle centers it.
+        self.clockLabels(state, t, !show_player);
+    }
+    if (show_player) self.media_clicked = self.clockPlayer(state, t, msnap.?, id_extra);
+    return show_player;
+}
+
+// Activity indicators on the left of the clock strip: recording (red),
+// screenshare (green), camera/mic use (blue), downloads (light gray).
+// Each glyph breathes dim<->bright on the hub curve (outQuart, 0.1s per
+// transition, +3 brightness at the bright end — see indicatorAmt): no
+// per-icon animation state, the tint is a pure function of the wall
+// clock, and hubFrame keeps frames coming while any indicator is live.
+// The pill widens 30px per indicator (see targetForFull); the clock
+// column keeps its width so the face never shifts when indicators come
+// and go.
+fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
+    _ = self;
+    const c = state.activity.counts();
+    const n = c.total();
+    if (n == 0) return;
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .background = false,
+        .gravity_y = 0.5,
+        .id_extra = id_extra,
+        .tag = "tophub_activity",
+    });
+    defer row.deinit();
+    const ms: i64 = std.Io.Clock.real.now(state.io).toMilliseconds();
+    // Integer phase first (see indicatorAmt): u64 epoch ms stays exact
+    // through the modulo, so the pulse actually advances. Quantize to
+    // 0.5 steps so the per-frame tint bake in Icons.iconPx reuses a
+    // handful of cached rasters instead of growing one per frame.
+    const amt_raw = indicatorAmt(@as(u64, @intCast(ms)));
+    const amt = @round(amt_raw * 2.0) / 2.0;
+
+    const glyph_px: f32 = 16;
+    // Order on the strip: record, share, camera, mic, download. One slot
+    // per live indicator (not per kind): two concurrent shares show two
+    // blinking glyphs. Icons stay comptime-selected per branch (tabler
+    // embeds only referenced icons).
+    const counts = [_]usize{ c.record, c.share, c.camera, c.mic, c.download };
+    var shown: usize = 0;
+    const t = dvui.themeGet();
+    for (counts, 0..) |n_kind, ki| {
+        const base: dvui.Color = switch (ki) {
+            0 => t.color(.err, .fill).lighten(-10),
+            1 => dvui.Color.green.lighten(-5),
+            2, 3 => t.color(.highlight, .fill).lighten(-10),
+            else => dvui.Color.gray.lighten(-5),
+        };
+        const tint = base.lighten(amt);
+        var j: usize = 0;
+        while (j < n_kind) : (j += 1) {
+            const crisp: ?Icons.Crisp = switch (ki) {
+                0 => Icons.iconPx(.player_record, glyph_px, tint) catch null,
+                1 => Icons.iconPx(.screen_share, glyph_px, tint) catch null,
+                2 => Icons.iconPx(.camera, glyph_px, tint) catch null,
+                3 => Icons.iconPx(.microphone, glyph_px, tint) catch null,
+                else => Icons.iconPx(.download, glyph_px, tint) catch null,
+            };
+            if (crisp) |ci| {
+                _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                    .max_size_content = .{ .w = glyph_px, .h = glyph_px },
+                    .padding = .all(10),
+                    .id_extra = id_extra * 100 + ki * 10 + j,
+                    .expand = .none,
+                });
+            }
+            shown += 1;
+            if (shown < n) _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+        }
+    }
+}
+
+// Clock face shared by the clock hub and the control-center header:
+// time over date, centered in the idle pill, left-aligned beside the
+// player (see tophubBase).
+pub fn clockLabels(self: *HubUi, state: *State, t: *dvui.Theme, centered: bool) void {
+    _ = self;
+    const ts = std.Io.Clock.real.now(state.io);
+    const s = ts.toSeconds();
+    const stamp = std.time.epoch.EpochSeconds{ .secs = @intCast(s) };
+    const ds = stamp.getDaySeconds();
+    const d = stamp.getEpochDay();
+    const dy = d.calculateYearDay();
+    const ax: f32 = if (centered) 0.5 else 0.0;
+    const txt = std.fmt.allocPrint(state.alloc, "{}:{}:{}", .{
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch return;
+    defer state.alloc.free(txt);
+    dvui.labelNoFmt(
+        @src(),
+        txt,
+        .{ .align_y = 0.5, .align_x = ax },
+        .{
+            .expand = .both,
+            .font = t.font_mono.withWeight(.bold).withSize(12.0),
+            .color_text = t.color(.highlight, .fill).lighten(5),
+            .padding = .{ .y = 6 },
+        },
+    );
+    const dw = [_][]const u8{
+        "Thursday", "Friday",  "Saturday",  "Sunday",
+        "Monday",   "Tuesday", "Wednesday",
+    };
+    const ms = [_][]const u8{
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    const dname = dw[@as(usize, @intCast(@divFloor(s, 86400))) % dw.len];
+    const dm = dy.calculateMonthDay();
+    const txt_ = std.fmt.allocPrint(state.alloc, "{s}, {s} {}", .{
+        dname,
+        ms[dm.month.numeric() - 1],
+        dm.day_index + 1,
+    }) catch return;
+    defer state.alloc.free(txt_);
+    dvui.labelNoFmt(
+        @src(),
+        txt_,
+        .{ .align_y = 0.5, .align_x = ax },
+        .{
+            .expand = .both,
+            .font = t.font_mono.withSize(8.0),
+            .padding = .{ .h = 6 },
+        },
+    );
+}
+
+// Embedded media player: LeafShell's MediaPlayer beside the clock —
+// music glyph, capped title with a thin seek readout, and the media
+// buttons (skip-back / play-pause / skip-forward, 28px each = the 84px
+// budget).
+// The buttons are invisible hit areas: plain boxes with no background,
+// hover, press, or focus visuals whatsoever — the row looks exactly
+// like static content, clicks just work. Returns true when a media
+// button consumed the click, so the clock background handler doesn't
+// also fire (see hubFrame's veto).
+// `id_extra` keeps widget ids distinct between the clock pill (0) and
+// the control-center header (100): both live in the hub window.
+pub fn clockPlayer(self: *HubUi, state: *State, t: *dvui.Theme, snap: State.Media.Snapshot, id_extra: usize) bool {
+    var prow = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .both,
+        .background = false,
+        .gravity_y = 0.5,
+        .id_extra = id_extra,
+        .tag = "player_row",
+    });
+    defer prow.deinit();
+
+    // Music glyph: fixed 26px column, rasterized at display size.
+    if (Icons.iconPx(.music, 24, .white) catch null) |crisp| {
+        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 26, .h = 26 },
+            .max_size_content = .{ .w = 26, .h = 26 },
+            .id_extra = id_extra,
+        });
+    }
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+
+    // Title + seek readout: capped at 160 so the fixed-size buttons
+    // never shift (see targetForMedia's budget).
+    {
+        var tcol = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .both,
+            .background = false,
+            .gravity_y = 0.5,
+            .max_size_content = dvui.Options.MaxSize.width(160),
+            .id_extra = id_extra,
+            .padding = .{ .h = 6, .y = 6 },
+        });
+        defer tcol.deinit();
+        var title_buf: [64]u8 = undefined;
+        const title = State.Media.truncateTitle(&title_buf, snap.title, 30);
+        dvui.labelNoFmt(@src(), title, .{
+            .align_x = 0.0,
+            .align_y = 0.5,
+        }, .{
+            .font = t.font_body.withSize(9.0),
+            .id_extra = id_extra,
+            .gravity_x = 0.0,
+            .padding = .all(2),
+        });
+        // Seek readout: interpolated position over track length
+        // (m:ss via State.Media.formatTime; unknown length shows 00:00).
+        var now_buf: [16]u8 = undefined;
+        var total_buf: [16]u8 = undefined;
+        const time_now = State.Media.formatTime(&now_buf, snap.position_us);
+        const time_total = State.Media.formatTime(&total_buf, snap.length_us);
+        dvui.label(@src(), "{s}/{s}", .{ time_now, time_total }, .{
+            .id_extra = id_extra,
+            .gravity_x = 0.0,
+            .color_text = t.color(.content, .text).opacity(40),
+            .font = t.font_body.withSize(7.0),
+            .padding = .all(2),
+        });
+        //dvui.progress(@src(), .{ .percent = snap.frac() }, .{
+        //    .expand = .horizontal,
+        //    // Explicit zero padding: progress_defaults force padding 2
+        //    // on all sides, and progress draws the fill in the CONTENT
+        //    // rect (size minus padding) — with the height pinned below,
+        //    // any padding eats the bar itself (a 4px pin + 2+2 padding =
+        //    // ~0px of visible fill). Zero padding makes the content rect
+        //    // equal the widget rect, so the pin below is the true
+        //    // thickness.
+        //    .padding = .all(0),
+        //    .min_size_content = .{ .h = 6 },
+        //    .max_size_content = dvui.Options.MaxSize.height(6),
+        //    .corners = .all(6),
+        //    .margin = .{ .y = 2 },
+        //    .id_extra = id_extra,
+        //    .gravity_x = 0.0,
+        //    .gravity_y = 1.0,
+        //});
+    }
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+
+    // Media buttons: three invisible 28px hit areas with 20px glyphs.
+    // Plain boxes (background = false, no hover/press/focus styling at
+    // all): `dvui.clicked` on the box rect is the entire interaction —
+    // nothing about the row's appearance changes, in any state (not
+    // even the cursor: hover_cursor is nulled). One block per button:
+    // the icon is a comptime tabler name, so the play/pause swap needs
+    // its own branch (no runtime icon values).
+    const btn_px: f32 = 28;
+    const glyph_px: f32 = 20;
+    {
+        var slot = dvui.box(@src(), .{}, .{
+            .background = false,
+            .min_size_content = .{ .w = btn_px, .h = btn_px },
+            .max_size_content = .{ .w = btn_px, .h = btn_px },
+            .gravity_y = 0.5,
+            .id_extra = id_extra * 10,
+        });
+        if (Icons.iconPx(.player_skip_back, glyph_px, .white) catch null) |crisp| {
+            _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+            });
+        }
+        if (dvui.clicked(slot.data(), .{ .hover_cursor = null })) {
+            self.media_clicked = true;
+            _ = state.media.previous();
+        }
+        slot.deinit();
+    }
+    {
+        var slot = dvui.box(@src(), .{}, .{
+            .background = false,
+            .min_size_content = .{ .w = btn_px, .h = btn_px },
+            .max_size_content = .{ .w = btn_px, .h = btn_px },
+            .gravity_y = 0.5,
+            .id_extra = id_extra * 10 + 1,
+        });
+        if (snap.status == .playing) {
+            if (Icons.iconPx(.player_pause, glyph_px, .white) catch null) |crisp| {
+                _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                    .gravity_x = 0.5,
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                });
+            }
+        } else {
+            if (Icons.iconPx(.player_play, glyph_px, .white) catch null) |crisp| {
+                _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                    .gravity_x = 0.5,
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                });
+            }
+        }
+        if (dvui.clicked(slot.data(), .{ .hover_cursor = null })) {
+            self.media_clicked = true;
+            _ = state.media.playPause();
+        }
+        slot.deinit();
+    }
+    {
+        var slot = dvui.box(@src(), .{}, .{
+            .background = false,
+            .min_size_content = .{ .w = btn_px, .h = btn_px },
+            .max_size_content = .{ .w = btn_px, .h = btn_px },
+            .gravity_y = 0.5,
+            .id_extra = id_extra * 10 + 2,
+        });
+        if (Icons.iconPx(.player_skip_forward, glyph_px, .white) catch null) |crisp| {
+            _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+            });
+        }
+        if (dvui.clicked(slot.data(), .{ .hover_cursor = null })) {
+            self.media_clicked = true;
+            _ = state.media.next();
+        }
+        slot.deinit();
+    }
+    return self.media_clicked;
+}
+
+pub fn handleClockClick(self: *HubUi, state: *State) void {
+    self.switchMode(.controls, state);
+}
+
+pub fn handleLauncherEnter(self: *HubUi, state: *State) void {
+    if (state.launcher.search(self.launcher_query)) |apps| {
+        if (apps.len > 0) {
+            var idx: usize = 0;
+            for (state.launcher.data.items, 0..) |*a, j| if (a == apps[0]) {
+                idx = j;
+                break;
+            };
+            state.launcher.run(idx);
+            self.switchMode(.clock, state);
+        }
+    }
+}

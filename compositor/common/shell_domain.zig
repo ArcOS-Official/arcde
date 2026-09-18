@@ -44,6 +44,12 @@ pub fn resolveRequestTarget(namespace: []const u8) error{UnknownNamespace}!Reque
     return error.UnknownNamespace;
 }
 
+/// Shell overlay stays visible unless its output has a fullscreen window,
+/// except exclusive-interactive panels which stay over fullscreen.
+pub fn overlayVisible(fullscreen_on_output: bool, exclusive: bool) bool {
+    return !fullscreen_on_output or exclusive;
+}
+
 test "shell domain namespaces" {
     try std.testing.expect(isShellNamespace("nshell"));
     try std.testing.expect(isShellNamespace("nshell-hub"));
@@ -58,4 +64,11 @@ test "request target resolution" {
     try std.testing.expectEqual(RequestTarget.shell_named, try resolveRequestTarget("nshell-hub"));
     try std.testing.expectError(error.UnknownNamespace, resolveRequestTarget("nshell-hub-evil"));
     try std.testing.expectError(error.UnknownNamespace, resolveRequestTarget("wobble"));
+}
+
+test "overlay visibility over fullscreen" {
+    try std.testing.expect(overlayVisible(false, false));
+    try std.testing.expect(overlayVisible(false, true));
+    try std.testing.expect(!overlayVisible(true, false));
+    try std.testing.expect(overlayVisible(true, true));
 }

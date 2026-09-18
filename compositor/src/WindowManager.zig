@@ -15,6 +15,7 @@ const util = @import("util.zig");
 const Output = @import("Output.zig");
 const Scene = @import("Scene.zig");
 const Seat = @import("Seat.zig");
+const ShellDomain = @import("shell_domain");
 const ShellSurface = @import("ShellSurface.zig");
 const Window = @import("Window.zig");
 const WmNode = @import("WmNode.zig");
@@ -468,6 +469,39 @@ fn renderFinish(wm: *WindowManager) void {
                     shell_surface.tree.node.raiseToTop();
                 },
             }
+        }
+    }
+
+    // Fullscreen covers the shell hub: hide shell-domain overlay surfaces
+    // on outputs with a rendered fullscreen window so the tophub pill
+    // doesn't float over it. Foreign overlays stay visible, and a shell
+    // surface with exclusive keyboard interactivity (an open panel:
+    // launcher, controls, ...) stays visible so it can still be used
+    // over fullscreen. Unconditional: this must also run when the
+    // stacking order didn't change.
+    {
+        var lit = server.layer_shell.surfaces.iterator();
+        while (lit.next()) |layer_surface| {
+            const wlr_layer_surface = layer_surface.wlr_layer_surface;
+            if (wlr_layer_surface.current.layer != .overlay) continue;
+            if (!wlr_layer_surface.surface.mapped) continue;
+            if (!ShellDomain.isShellNamespace(std.mem.span(wlr_layer_surface.namespace))) continue;
+            const wlr_output = wlr_layer_surface.output orelse continue;
+            var fullscreen_on_output = false;
+            var wit = wm.windows.iterator();
+            while (wit.next()) |window| {
+                if (!renderedFullscreen(window)) continue;
+                const fs_out = window.wm_requested.fullscreen orelse continue;
+                const fs_wlr = fs_out.wlr_output orelse continue;
+                if (fs_wlr == wlr_output) {
+                    fullscreen_on_output = true;
+                    break;
+                }
+            }
+            const exclusive = wlr_layer_surface.current.keyboard_interactive == .exclusive;
+            const visible = ShellDomain.overlayVisible(fullscreen_on_output, exclusive);
+            layer_surface.scene_layer_surface.tree.node.setEnabled(visible);
+            layer_surface.popup_tree.node.setEnabled(visible);
         }
     }
 

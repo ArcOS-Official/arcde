@@ -26,11 +26,6 @@ const KeyConsumer = union(enum) {
     /// The river_xkb_bindings_seat_v1.ensure_next_key_eaten request caused
     /// the key to be eaten.
     ensure_eaten,
-    /// A MOD key press/release swallowed by the mod-tap shell gesture: the
-    /// focus detour is the entire gesture, the key itself is not forwarded.
-    /// Only used when focus is not on a shell-process surface (see
-    /// `Seat.focusedIsShellProcess`, which receives MOD normally).
-    mod_tap,
     im_grab,
     /// Seat's focused client
     focus,
@@ -292,60 +287,14 @@ fn handleKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboa
             // Decision is made on press; release only follows it.
             const kv = group.pressed.fetchSwapRemove(event.keycode).?;
             assert(kv.value.count == 0);
-            // A MOD release with a focus consumer while the shell holds
-            // mod-tap focus must be delivered before restoring focus —
-            // otherwise the press/release pair splits across clients and
-            // the shell's MOD stays stuck. Detect MOD first, deliver
-            // below, restore after.
-            var is_mod_release = false;
-            for (xkb_state.keyGetSyms(event.keycode + 8)) |sym| {
-                if (Seat.shellModSym(sym)) {
-                    is_mod_release = true;
-                    break;
-                }
-            }
-            if (is_mod_release and group.seat.shell_mod.focus_from_mod) {
-                if (kv.value.consumer == .focus) {
-                    const out_keycode = Seat.translateShellKeycode(event.keycode);
-                    group.seat.wlr_seat.setKeyboard(&group.state);
-                    group.seat.wlr_seat.keyboardNotifyKey(event.time_msec, out_keycode, .released);
-                    const translated = Seat.translateShellModifiers(group.config.keymap, group.state.modifiers);
-                    group.seat.wlr_seat.keyboardNotifyModifiers(&translated);
-                    for (xkb_state.keyGetSyms(event.keycode + 8)) |sym| {
-                        group.seat.shellModTap(sym, false, false);
-                    }
-                    group.sendState();
-                    return;
-                }
-            }
-            // A swallowed MOD press is never forwarded, so its release is
-            // swallowed too — after restoring the mod-tap shell focus.
-            // Mod-tap shell gesture: restore previous focus on MOD release.
-            // Sym lookup is a pure keymap query, valid on release too.
-            for (xkb_state.keyGetSyms(event.keycode + 8)) |sym| {
-                group.seat.shellModTap(sym, false, false);
-            }
-            if (kv.value.consumer == .mod_tap) {
-                group.sendState();
-                return;
-            }
             break :blk kv.value.consumer;
         }
         // Translate libinput keycode -> xkbcommon
         const xkb_keycode = event.keycode + 8;
         const modifiers = group.state.getModifiers();
-        // Mod-tap shell gesture: MOD press with nothing else held focuses
-        // the registered shell. The MOD key itself is swallowed unless
-        // keyboard focus is on a surface owned by the shell's own process
-        // (shell hub or its overlays), which receives MOD normally — so
-        // combos keep working with shell focused but foreign clients never
-        // see the MOD press/release.
-        for (xkb_state.keyGetSyms(xkb_keycode)) |sym| {
-            group.seat.shellModTap(sym, true, group.pressed.count() != 0);
-        }
-        for (xkb_state.keyGetSyms(xkb_keycode)) |sym| {
-            if (Seat.shellModSym(sym) and !group.seat.focusedIsShellProcess()) break :blk .mod_tap;
-        }
+        // Bare MOD is just a modifier: no gesture, no swallowing — it is
+        // forwarded to the focused client like any other key. The launcher
+        // opens only via the MOD+/ keybinding (matched below).
         if (group.seat.matchXkbBinding(xkb_keycode, modifiers, xkb_state)) |binding| {
             log.debug("matched xkb binding", .{});
             group.seat.xkb_bindings_seat.ensure_next_key_eaten = false;
@@ -371,14 +320,6 @@ fn handleKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboa
         }
         if (group.getInputMethodGrab() != null) {
             break :blk .im_grab;
-        }
-        // Win-held chords that match no WM binding belong to the shell
-        // domain: detour focus there so foreign windows never observe
-        // Win-modified input. (A lone MOD press is swallowed above;
-        // bindings and input-method grabs win over this detour, and a
-        // failed detour — locked, shell gone — falls through to focus.)
-        if (if (util.modIsAlt()) modifiers.alt else modifiers.logo) {
-            _ = group.seat.shellChordDetour();
         }
         break :blk .focus;
     };
@@ -408,7 +349,6 @@ fn handleKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboa
             keyboard_grab.setKeyboard(&group.state);
             keyboard_grab.sendKey(event.time_msec, event.keycode, event.state);
         },
-        .mod_tap => {},
         .focus => {
             group.seat.wlr_seat.setKeyboard(&group.state);
             var out_keycode = event.keycode;

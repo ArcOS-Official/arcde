@@ -247,7 +247,7 @@ One message is pushed per state change: `new_window`, `window_closed`,
 `window_state_changed`, `window_workspace_changed`, `output_added`,
 `output_removed`, `output_changed`, `workspace_created`, `workspace_removed`,
 `workspace_activated`, `workspace_deactivated`, `switch_workspace`,
-`launcher_opened`, `launcher_closed` (mod-tap shell gesture, see below),
+`launcher_opened`, `launcher_closed` (MOD+/ launcher gesture, see below),
 `shell_focus_changed { focused }` (keyboard focus on the shared shell
 domain — the bar or hub surface — gained/lost; bar<->hub transitions
 publish no edge. Also pushed once right after every `shell_register`
@@ -262,7 +262,7 @@ no-ops — staying connected is the subscription mechanism.
 asynchronously on the main thread (acked with `pong`); the outcome arrives
 as a push.
 
-### Shell launcher (mod-tap) and the shell focus domain
+### Shell launcher (MOD+/) and the shell focus domain
 
 The shell UI is a fixed focus domain: the bar (`nshell`) and hub overlay
 (`nshell-hub`) layer surfaces. Keyboard focus on either one counts as
@@ -273,26 +273,22 @@ reconnect). Registration converges focus state only — namespaces are not
 transferable, so no client can hijack them.
 `request_keyboard_focus { namespace }` (empty = topmost domain surface)
 focuses shell UI from either shell surface; namespaces outside the
-domain are rejected, never retargeted at other windows.
-Holding the MOD key (Alt when nested,
-Super/Logo on DRM/KMS — see `util.modMask`) with nothing else held focuses
+domain are rejected, never retargeted at other windows. Programmatic
+focus moves never open the launcher — they only move focus.
+Pressing MOD+/ (Alt when nested,
+Super/Logo on DRM/KMS — see `util.modMask`) focuses
 a shell-domain surface and broadcasts
-`launcher_opened`, so the shell can show its launcher UI. Releasing MOD
-broadcasts `launcher_closed` and, if focus is still on the shell, restores
-whatever had focus before the hold.
-The MOD key itself is swallowed for foreign clients — no press/release key
-event from the MOD press alone — the focus detour plus the broadcasts are
-the gesture. Surfaces owned by the shell's own process (the shell hub
-itself or any overlay/window it spawned, matched by client pid) receive
-MOD normally, so the shell can track MOD held state; if focus is already
-on one of those surfaces the detour leaves it alone (no refocus, no
-broadcast) and MOD is delivered straight to it.
+`launcher_opened`, so the shell can show its launcher UI. This is the
+only path that opens the launcher: pressing or holding MOD alone does
+nothing (bare MOD is just a modifier, forwarded to the focused client
+like any other key), and bare slash/p keys never open it either.
+The launcher is stay-open: releasing MOD never closes it and never
+restores focus. It dismisses via Escape (the shell pushes focus back to
+the app) or focus loss (Alt+Tab, click-away). `launcher_closed` is
+broadcast only on explicit `release_keyboard_focus`.
 Key combos keep working throughout: keybindings are matched before focus
 dispatch, so MOD+key fires regardless of which surface has focus.
-A Win-held chord that matches no binding is detoured to the shell domain
-like a tap (focus moves, `launcher_opened` fires); unmatched keys flow to
-the focused surface as usual, so foreign windows never observe
-Win-modified input.
+Unmatched keys flow to the focused surface as usual.
 
 ### Thumbnail captures
 

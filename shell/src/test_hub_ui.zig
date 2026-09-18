@@ -110,8 +110,18 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
         } else if (std.mem.eql(u8, t, "render")) {
             // Frame-level mode redirects from hubFrame's render switch.
             switch (h.hubmode) {
-                .search => h.switchMode(.launcher, &state),
+                // Legacy .search is never entered; prod fails safe to clock.
+                .search => h.switchMode(.clock, &state),
                 else => {},
+            }
+        } else if (std.mem.eql(u8, t, "mod_slash")) {
+            // Compositor MOD+/ binding: focus detour + launcher_opened
+            // broadcast, consumed by hubFrame as a pending edge that
+            // switchModes in hub context. The only launcher opener.
+            state.launcher_open_pending = true;
+            if (state.launcher_open_pending) {
+                state.launcher_open_pending = false;
+                h.switchMode(.launcher, &state);
             }
         } else if (std.mem.eql(u8, t, "advance")) {
             now += @intCast(obj.get("ms").?.integer);
@@ -716,12 +726,10 @@ test "hub_ui: entering clock pushes focus to head window" {
     try testing.expectEqual(@as(usize, 1), focus_actions);
 }
 
-test "hub_ui: global shortcuts yield to text entries" {
-    // The launcher search, the wifi search, and the wifi password entry
-    // own printable keystrokes. Single-key shortcuts must not fire while
-    // those panels are open: typing "p" or "/" in the network panel used
-    // to yank the hub into the launcher, and Tab armed the switcher
-    // instead of moving entry focus (dvui's next-widget bind).
+test "hub_ui: bare slash/p never open the launcher" {
+    // The launcher opens only via the compositor MOD+/ binding
+    // (launcher_open_pending). Bare slash/p keys are inert in every hub
+    // mode: no mode switch, no focus request.
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -750,13 +758,67 @@ test "hub_ui: global shortcuts yield to text entries" {
     try testing.expect(!h.handleGlobalKey(.tab, .down, false, 1000, &state));
     try testing.expect(!h.switcher_pending);
 
-    // From clock the shortcuts still fire.
+    // From clock the keys are inert too — MOD+/ is the only opener.
     h.switchMode(.clock, &state);
-    try testing.expect(h.handleGlobalKey(.p, .down, false, 1000, &state));
-    try testing.expectEqual(HubUi.HubMode.launcher, h.hubmode);
-    h.switchMode(.clock, &state);
-    try testing.expect(h.handleGlobalKey(.slash, .down, false, 1000, &state));
-    try testing.expectEqual(HubUi.HubMode.launcher, h.hubmode);
+    try testing.expect(!h.handleGlobalKey(.p, .down, false, 1000, &state));
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+    try testing.expect(!h.handleGlobalKey(.slash, .down, false, 1000, &state));
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+}
+
+test "hub_ui: clock entry pushes focus only within the current workspace" {
+    // Launcher run on an empty workspace must not snap focus back to a
+    // window on another workspace: no focus_window is queued, so input
+    // can't land on a hidden window. A same-workspace head still
+    // restores as before.
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    // Two workspaces; current = 1, MRU head lives on 2.
+    const ws = try state.alloc.alloc(proto.Workspace, 2);
+    ws[0] = .{ .id = 1, .number = 1, .active = true, .current = true, .output = 1 };
+    ws[1] = .{ .id = 2, .number = 2, .output = 1 };
+    state.workspaces = ws;
+    const wins = try state.alloc.alloc(proto.Window, 1);
+    wins[0] = .{ .id = 100, .workspace = 2 };
+    state.windows = wins;
+
+    var h = HubUi.init();
+    h.switchMode(.launcher, &state);
+    _ = h.handleLauncherKey(.escape, .down, &state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+
+    // No focus_window queued for the off-workspace head.
+    var batch: std.ArrayList(State.Action) = .empty;
+    defer batch.deinit(alloc);
+    state.req_q.popAll(io, &batch);
+    for (batch.items) |a| switch (a) {
+        .focus_window => try testing.expect(false),
+        else => {},
+    };
+
+    // Same-workspace head restores as before.
+    wins[0].workspace = 1;
+    h.switchMode(.launcher, &state);
+    _ = h.handleLauncherKey(.escape, .down, &state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+    var batch2: std.ArrayList(State.Action) = .empty;
+    defer batch2.deinit(alloc);
+    state.req_q.popAll(io, &batch2);
+    var focus_actions: usize = 0;
+    for (batch2.items) |a| switch (a) {
+        .focus_window => |id| {
+            focus_actions += 1;
+            try testing.expectEqual(@as(u64, 100), id);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), focus_actions);
 }
 
 test "hub_ui: clock entry pushes no focus when unfocused or empty" {
@@ -936,7 +998,7 @@ test "hub_ui: focus lost commits selection and resets" {
     var h = HubUi.init();
 
     _ = h.handleGlobalKey(.tab, .down, false, 1000, &state);
-    h.hub_keyboard_focused.store(false, .seq_cst); // MOD released
+    h.hub_keyboard_focused.store(false, .seq_cst); // focus lost (Alt+Tab/click-away)
     _ = h.updateSwitcher(1050, &state);
     try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
     try testing.expect(!h.switcher_pending);

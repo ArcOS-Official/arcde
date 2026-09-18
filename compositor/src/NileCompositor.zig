@@ -478,6 +478,16 @@ pub const NileCompositor = struct {
             };
             _ = b;
         }
+        // MOD+/: open the launcher. This is the only launcher opener:
+        // bare MOD does nothing, and releasing MOD never closes — the
+        // launcher stays open until Escape or focus loss.
+        {
+            const b = Nile.Seat.addXkbBinding(seat, xkb.Keysym.slash, mod) catch |err| {
+                log.warn("failed to register launcher binding: {}", .{err});
+                return;
+            };
+            _ = b;
+        }
         // MOD+Shift+q: quit compositor (two-step: prompt, then confirm)
         {
             const b = Nile.Seat.addXkbBinding(seat, xkb.Keysym.q, shift_mod) catch |err| {
@@ -628,11 +638,16 @@ pub const NileCompositor = struct {
     }
 
     fn onWindowUnmap(self: *NileCompositor, win: *Window) void {
-        _ = self;
-        _ = win;
+        // The focused window went away (minimize/close): fall back so
+        // input never rests on a gone window.
+        self.refocusAfterWindowGone(win);
     }
 
     fn onWindowDestroy(self: *NileCompositor, win: *Window) void {
+        // The focused window is gone: fall back first, while the pointer
+        // is still valid (wm_requested is already reset by teardown, so
+        // this must run before the tree detach below).
+        self.refocusAfterWindowGone(win);
         // Detach the window from whichever tiling tree holds its tile.
         // Every tree is scanned by pointer identity: the window's recorded
         // workspace cannot be trusted here — manageStart resets wm_requested
@@ -686,6 +701,15 @@ pub const NileCompositor = struct {
     }
 
     fn onKeybindPressed(self: *NileCompositor, binding: *XkbBinding) void {
+        // MOD+/: open the launcher (no shift)
+        if (binding.keysym == xkb.Keysym.slash) {
+            const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
+            if (!mods.shift) {
+                log.info("launcher keybinding: open launcher", .{});
+                self.openLauncher();
+                return;
+            }
+        }
         // MOD+w: close focused window (no shift)
         if (binding.keysym == xkb.Keysym.w) {
             const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
@@ -771,37 +795,14 @@ pub const NileCompositor = struct {
         _ = self;
         switch (seat.focused) {
             .window => |w| return w,
-            .layer_surface => {
-                // Shell has focus via MOD-tap — act on the window that was focused before detour.
-                // Defer until MOD release so input is still copied to shell and we float THAT window.
-                if (seat.shell_mod.focus_from_mod) {
-                    switch (seat.shell_mod.prev) {
-                        .window => |ref| if (ref.get()) |prev_win| {
-                            // Mark for deferred toggle; Seat.shellModTap will consume on release
-                            prev_win.requestToggleFloating();
-                            log.info("toggle floating deferred to MOD release for window {?s}", .{prev_win.getTitle()});
-                            return null;
-                        },
-                        else => {},
-                    }
-                }
-                // Fallback: if shell focused without MOD-tap, try prev anyway immediately
+            else => {
+                // Shell (or nothing) holds focus while the launcher is
+                // open: act on the pre-detour window at once. The launcher
+                // is stay-open, so unlike the old tap peek there is no
+                // MOD-release deferral.
                 switch (seat.shell_mod.prev) {
                     .window => |ref| if (ref.get()) |prev_win| return prev_win,
                     else => {},
-                }
-                return null;
-            },
-            else => {
-                if (seat.shell_mod.focus_from_mod) {
-                    switch (seat.shell_mod.prev) {
-                        .window => |ref| if (ref.get()) |prev_win| {
-                            prev_win.requestToggleFloating();
-                            log.info("toggle floating deferred to MOD release for window {?s}", .{prev_win.getTitle()});
-                            return null;
-                        },
-                        else => {},
-                    }
                 }
                 return null;
             },
@@ -887,9 +888,8 @@ pub const NileCompositor = struct {
         switch (seat.focused) {
             .window => |w| return w,
             else => {
-                // Shell (or nothing) holds focus — e.g. MOD-tap detour:
-                // act on the pre-detour window at once. Fullscreen applies
-                // instantly, so unlike floating no MOD-release deferral.
+                // Shell (or nothing) holds focus — e.g. MOD+/ detour:
+                // act on the pre-detour window at once.
                 switch (seat.shell_mod.prev) {
                     .window => |ref| if (ref.get()) |prev_win| return prev_win,
                     else => {},
@@ -901,7 +901,7 @@ pub const NileCompositor = struct {
 
     /// Window behind the current focus for close semantics: the focused
     /// window itself, or — while shell UI (launcher/panel) holds focus —
-    /// the window that was focused before the detour (MOD-tap prev or
+    /// the window that was focused before the detour (MOD+/ prev or
     /// programmatic request prev). Otherwise null (nothing to close).
     fn resolveCloseTarget(self: *NileCompositor, seat: *@import("Seat.zig")) ?*Window {
         _ = self;
@@ -926,6 +926,14 @@ pub const NileCompositor = struct {
         };
         log.info("window {?s} close requested (MOD+w)", .{win.getTitle()});
         Nile.Window.close(win);
+    }
+
+    /// MOD+/ launcher: focus shell UI and broadcast `launcher_opened` so
+    /// the shell shows its launcher (see Seat.openLauncher). Stay-open:
+    /// releasing MOD does nothing; Escape or focus loss dismisses.
+    fn openLauncher(self: *NileCompositor) void {
+        _ = self;
+        Nile.Seat.default().openLauncher();
     }
 
     /// Two-step logout: first MOD+Shift+q arms the confirm and broadcasts
@@ -1333,6 +1341,17 @@ pub const NileCompositor = struct {
                 Nile.dirtyRendering();
             },
         }
+    }
+
+    /// The focused window went away (unmap/destroy): fall back to the
+    /// first mapped window on the current workspace, else clear focus.
+    /// Input must never rest on a gone window, and an empty workspace
+    /// holds no focus. No-op when some other surface holds focus.
+    fn refocusAfterWindowGone(self: *NileCompositor, win: *Window) void {
+        const seat = Nile.Seat.default();
+        const focused_gone = seat.focused == .window and seat.focused.window == win;
+        if (!focused_gone) return;
+        self.updateFocusForWorkspace(server.workspace.currentWorkspace());
     }
 
     /// Focus the first window on workspace `id`, or clear focus if the workspace is empty.

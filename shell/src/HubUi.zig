@@ -98,7 +98,7 @@ fade_to_controls: bool = false,
 net_tab: NetTab = .wifi,
 // Back-button origin: set to .controls whenever a sub-panel (network,
 // launcher, windows) opens FROM the control center, null when it opened
-// from the base UI (clock, bar button, / or Tab key). Only the network
+// from the base UI (clock, bar button, MOD+/ or Tab key). Only the network
 // header's back button reads it (the sole path back to the control
 // center, riding the close fade); Escape and keyboard-focus loss always
 // dismiss to clock, from every mode. Cleared on entering clock or
@@ -280,13 +280,22 @@ pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
     if (mode == .clock and self.hubmode != .clock) {
         // Clock mode never holds keyboard focus: push it back to the
         // user's app. Windows stay in MRU focus order, so the head is
-        // the last focused non-shell window (shell surfaces never enter
-        // this list). Only when the hub actually holds focus — if focus
-        // already moved elsewhere (click), there is nothing to push.
+        // normally the last focused non-shell window (shell surfaces
+        // never enter this list). Only when the hub actually holds
+        // focus — if focus already moved elsewhere (click), there is
+        // nothing to push.
         // Skipped right after an explicit focusWindow (switcher), which
         // names its own target.
+        // Scoped to the current workspace: if the MRU head lives on
+        // another workspace (e.g. the launcher ran on an empty
+        // workspace and nothing was focused there), pushing would either
+        // yank the workspace or park input on a hidden window — push
+        // nothing instead. A launched app takes focus when it maps;
+        // otherwise focus stays none.
         if (!self.suppress_clock_push and self.hubFocused() and state.windows.len > 0) {
-            state.focusWindow(state.windows[0].id);
+            const head = state.windows[0];
+            const off_workspace = if (state.currentWorkspaceId()) |cur| head.workspace != cur else false;
+            if (!off_workspace) state.focusWindow(head.id);
         }
     }
     if (mode == .windows) {
@@ -596,9 +605,10 @@ pub fn handleGlobalKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, sh
     // Text-entry modes own printable keystrokes: the launcher search, the
     // network wifi search, and the wifi password entry receive .text via
     // the focused widget. The global single-key shortcuts must stay out:
-    // typing "p" or "/" in the wifi search/password used to yank the hub
-    // into the launcher, and Tab (dvui's next-widget bind) armed the
-    // window switcher instead of moving entry focus.
+    // Tab (dvui's next-widget bind) must not arm the window switcher
+    // instead of moving entry focus. The launcher opens only via the
+    // compositor MOD+/ binding (launcher_open_pending) — never via bare
+    // slash/p keys, so typing those anywhere is inert.
     const in_text_entry = self.hubmode == .launcher or self.hubmode == .network;
     const is_tab_down = code == .tab and action == .down;
     if (is_tab_down) {
@@ -619,14 +629,7 @@ pub fn handleGlobalKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, sh
             return true;
         }
     }
-    if (action == .down) {
-        if (code == .slash or code == .p) {
-            if (!in_text_entry) {
-                self.switchMode(.launcher, state);
-                return true;
-            }
-        }
-    }
+    // (No slash/p shortcut: the launcher opens only via MOD+/.)
     return false;
 }
 
@@ -704,9 +707,10 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
         self.toggleNetworkMenu(state);
     }
 
-    // MOD-tap launcher edges from the compositor (see State). Opening
-    // requests focus via switchMode; closing dismisses to clock. A tap
-    // that opens and closes back-to-back nets out to a peek.
+    // MOD+/ launcher edge from the compositor (see State): the binding
+    // focused shell UI and broadcast launcher_opened. Opening requests
+    // focus via switchMode; closing (explicit release_keyboard_focus)
+    // dismisses to clock. Stay-open: releasing MOD alone never closes.
     if (state.launcher_open_pending) {
         state.launcher_open_pending = false;
         self.switchMode(.launcher, state);
@@ -932,10 +936,14 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                 defer row.deinit();
                 // Single button in a horizontal box packs left (gravity
                 // defaults to 0.0): spacers on both sides center it.
+                // The launcher opens only via the compositor MOD+/
+                // binding: this row is a hint, never a button, so clicks
+                // here can't open it.
                 _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-                if (dvui.button(@src(), "Launcher  \u{2318}P / /", .{}, .{ .min_size_content = .{ .h = 18 } })) {
-                    self.switchMode(.launcher, state);
-                }
+                dvui.label(@src(), "Launcher  MOD + /", .{}, .{
+                    .color_text = t.color(.content, .text).opacity(60),
+                    .min_size_content = .{ .h = 18 },
+                });
                 _ = dvui.spacer(@src(), .{ .expand = .horizontal });
             }
             // Background click opens the control center — evaluated last,
@@ -2196,7 +2204,9 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
             self.activitySection(state, t);
             self.powerSection(state, t);
         },
-        .search => self.switchMode(.launcher, state),
+        // Legacy .search mode is never entered (the launcher opens only
+        // via MOD+/): fail safe to clock, never to the launcher.
+        .search => self.switchMode(.clock, state),
     }
 
     return .ok;

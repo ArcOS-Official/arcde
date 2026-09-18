@@ -153,7 +153,7 @@ workspaces: []proto.Workspace = &.{},
 windows: []proto.Window = &.{},
 outputs: []proto.Output = &.{},
 
-// MOD-tap launcher edges from the compositor (see applyEvent). Set on
+// MOD+/ launcher edges from the compositor (see applyEvent). Set on
 // the UI thread, consumed by HubUi.hubFrame. Plain bools: both sides
 // run on the UI thread (pushes arrive via the commit queue).
 launcher_open_pending: bool = false,
@@ -1395,9 +1395,10 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
             // Unknown workspace: fetch via upsert fallback (rare).
             // Leave as-is; next full list will converge.
         },
-        // MOD-tap launcher gesture: the compositor focused the shell
-        // (opened) or moved on (closed). HubUi.hubFrame consumes these
-        // as pending flags so switchMode runs in hub window context.
+        // MOD+/ launcher gesture: the compositor focused the shell
+        // (opened) or released it explicitly (closed). HubUi.hubFrame
+        // consumes these as pending flags so switchMode runs in hub
+        // window context.
         .launcher_opened => {
             self.launcher_open_pending = true;
         },

@@ -247,7 +247,7 @@ One message is pushed per state change: `new_window`, `window_closed`,
 `window_state_changed`, `window_workspace_changed`, `output_added`,
 `output_removed`, `output_changed`, `workspace_created`, `workspace_removed`,
 `workspace_activated`, `workspace_deactivated`, `switch_workspace`,
-`launcher_opened`, `launcher_closed` (mod-tap shell gesture, see below),
+`launcher_opened`, `launcher_closed` (MOD+/ launcher gesture, see below),
 `shell_focus_changed { focused }` (keyboard focus on the registered shell
 surface gained/lost; also pushed once right after every `shell_register`
 so a (re)connected shell converges without waiting for the next edge)
@@ -261,23 +261,20 @@ no-ops — staying connected is the subscription mechanism.
 asynchronously on the main thread (acked with `pong`); the outcome arrives
 as a push.
 
-### Shell launcher (mod-tap)
+### Shell launcher (MOD+/)
 
 The shell declares its interactive layer surface with
 `shell_register { namespace }` (acked with `pong`; re-send on every
-reconnect, last writer wins). Holding the MOD key (Alt when nested,
-Super/Logo on DRM/KMS — see `util.modMask`) with nothing else held focuses
-that surface and broadcasts
-`launcher_opened`, so the shell can show its launcher UI. Releasing MOD
-broadcasts `launcher_closed` and, if focus is still on the shell, restores
-whatever had focus before the hold.
-The MOD key itself is swallowed for foreign clients — no press/release key
-event from the MOD press alone — the focus detour plus the broadcasts are
-the gesture. Surfaces owned by the shell's own process (the shell hub
-itself or any overlay/window it spawned, matched by client pid) receive
-MOD normally, so the shell can track MOD held state; if focus is already
-on one of those surfaces the detour leaves it alone (no refocus, no
-broadcast) and MOD is delivered straight to it.
+reconnect, last writer wins). Pressing MOD+/ (Alt when nested,
+Super/Logo on DRM/KMS — see `util.modMask`) focuses that surface and
+broadcasts `launcher_opened`, so the shell can show its launcher UI.
+This is the only path that opens the launcher: pressing or holding MOD
+alone does nothing (bare MOD is just a modifier, forwarded to the
+focused client like any other key).
+The launcher is stay-open: releasing MOD never closes it and never
+restores focus. It dismisses via Escape (the shell pushes focus back to
+the app) or focus loss (Alt+Tab, click-away). `launcher_closed` is
+broadcast only on explicit `release_keyboard_focus`.
 Key combos keep working throughout: keybindings are matched before focus
 dispatch, so MOD+key fires regardless of which surface has focus, and
 unmatched keys flow to the focused surface as usual.

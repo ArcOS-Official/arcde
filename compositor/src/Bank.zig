@@ -946,15 +946,18 @@ pub fn getFocusSwitchesWorkspace() bool {
 }
 
 // Programmatic keyboard focus requested via nilebank `request_keyboard_focus`.
-// Mirrors the mod-tap shell detour but is driven by explicit client requests
-// (e.g. the app launcher) instead of holding MOD. Stored per default seat
-// conceptually but tracked globally for the single-shell case.
+// Driven by explicit client requests (e.g. the shell focusing its own hub)
+// instead of the MOD+/ detour. Stored per default seat conceptually but
+// tracked globally for the single-shell case. These paths only move focus —
+// they never broadcast `launcher_opened`: the launcher opens solely via the
+// MOD+/ keybinding, and the shell already knows which panel it wants.
 var request_keyboard_focus_active: bool = false;
 var request_keyboard_focus_shell: ?LayerSurface.Ref = null;
 var request_keyboard_focus_prev: Seat.ShellPrevFocus = .none;
-// If true, this request was initiated while MOD was held (shell_mod detour
-// active). Releasing MOD does NOT restore focus; focus stays pinned until
-// MOD is pressed again (next tap).
+// If true, this request was initiated while the MOD+/ launcher detour
+// (shell_mod) was active. Ownership transfers from the detour to this
+// sticky request; the detour state is cleared and focus stays until an
+// explicit `release_keyboard_focus`.
 var request_keyboard_focus_pinned_during_mod: bool = false;
 
 pub fn isRequestKeyboardFocusActive() bool {
@@ -975,52 +978,6 @@ pub fn requestPrevWindow() ?*Window {
         .window => |ref| ref.get(),
         else => null,
     };
-}
-
-/// Release a pinned request from the Seat's MOD-press handler (main thread).
-/// Mirrors the `release_keyboard_focus` pipe handler but runs synchronously.
-pub fn releasePinnedRequestOnModPress() void {
-    if (!request_keyboard_focus_active or !request_keyboard_focus_pinned_during_mod) return;
-    const seat = server.input_manager.defaultSeat();
-    const shell_ref = request_keyboard_focus_shell;
-    const on_shell = if (shell_ref) |r|
-        seat.focused == .layer_surface and
-            seat.focused.layer_surface.ref.key.index == r.key.index and
-            seat.focused.layer_surface.ref.key.generation == r.key.generation
-    else
-        false;
-    // Preserve prev for deferred floating-toggle before clearing.
-    const prev = request_keyboard_focus_prev;
-    request_keyboard_focus_active = false;
-    request_keyboard_focus_shell = null;
-    request_keyboard_focus_pinned_during_mod = false;
-    if (on_shell) {
-        switch (prev) {
-            .window => |ref| if (ref.get()) |win| {
-                seat.focus(.{ .window = win });
-            } else {
-                seat.focus(.none);
-            },
-            .layer_surface => |ref| if (ref.get()) |ls| {
-                seat.focus(.{ .layer_surface = ls });
-            } else {
-                seat.focus(.none);
-            },
-            .none => seat.focus(.none),
-        }
-    }
-    // Deferred MOD+f floating toggle staged on the window before the pin.
-    switch (prev) {
-        .window => |ref| if (ref.get()) |win| {
-            if (win.consumePendingFloatingToggle()) {
-                _ = win.toggleFloating();
-            }
-        },
-        else => {},
-    }
-    request_keyboard_focus_prev = .none;
-    log.info("bank: pinned request released on MOD press -> restored", .{});
-    broadcast(.{ .launcher_closed = {} });
 }
 
 fn findLayerSurfaceByNamespace(namespace: []const u8) ?*LayerSurface {
@@ -1058,14 +1015,25 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                 if (windowFromId(id)) |win| {
                     const target_ws = win.wm_requested.workspace;
                     const cur_ws = server.workspace.currentWorkspace();
+                    const seat = server.input_manager.defaultSeat();
                     if (target_ws != cur_ws and focus_switches_workspace) {
                         _ = server.workspace.switchWorkspace(target_ws) catch |err| {
                             log.warn("bank: focus window {d} switch to workspace {d} failed: {}", .{ id, target_ws, err });
                         };
+                        seat.wm_requested.focus = .{ .window = win.ref };
+                        server.wm.dirtyWindowing();
+                    } else if (target_ws != cur_ws) {
+                        // Workspace switching on focus is disabled: the
+                        // target is hidden on another workspace, so
+                        // focusing it would park keyboard input where the
+                        // user can't see it. Clear instead — an empty (or
+                        // foreign) workspace holds no focus.
+                        seat.wm_requested.focus = .clear;
+                        server.wm.dirtyWindowing();
+                    } else {
+                        seat.wm_requested.focus = .{ .window = win.ref };
+                        server.wm.dirtyWindowing();
                     }
-                    const seat = server.input_manager.defaultSeat();
-                    seat.wm_requested.focus = .{ .window = win.ref };
-                    server.wm.dirtyWindowing();
                     log.info("bank: focus window {d} (ws {d} -> cur {d} switch={})", .{ id, target_ws, cur_ws, focus_switches_workspace });
                 } else {
                     log.warn("bank: focus window {d}: unknown id", .{id});
@@ -1189,16 +1157,15 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                             request_keyboard_focus_shell = shell.ref;
                             request_keyboard_focus_pinned_during_mod = true;
                         }
-                        log.info("bank: request_keyboard_focus '{s}' pinned (already focused) during MOD hold", .{v.namespace});
-                        broadcast(.{ .launcher_opened = {} });
+                        log.info("bank: request_keyboard_focus '{s}' pinned (already focused) during launcher detour", .{v.namespace});
                     } else {
                         log.info("bank: request_keyboard_focus '{s}' already focused", .{v.namespace});
                     }
                     return 0;
                 }
-                // Pinning: request arrived while MOD holds the shell.
-                // Transfer ownership from the transient MOD detour to the
-                // sticky request so releasing MOD does NOT restore.
+                // Pinning: request arrived while the MOD+/ launcher detour
+                // holds the shell. Transfer ownership from the detour to
+                // the sticky request.
                 if (seat.shell_mod.focus_from_mod) {
                     const orig_prev = seat.shell_mod.prev;
                     _ = seat.shell_mod.shell;
@@ -1217,8 +1184,7 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                     if (seat.focused != .layer_surface or seat.focused.layer_surface != shell) {
                         seat.focus(.{ .layer_surface = shell });
                     }
-                    log.info("bank: request_keyboard_focus '{s}' pinned during MOD hold -> retained after release", .{v.namespace});
-                    broadcast(.{ .launcher_opened = {} });
+                    log.info("bank: request_keyboard_focus '{s}' pinned during launcher detour -> retained", .{v.namespace});
                     return 0;
                 }
                 if (!request_keyboard_focus_active) {
@@ -1236,7 +1202,6 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                 }
                 seat.focus(.{ .layer_surface = shell });
                 log.info("bank: request_keyboard_focus '{s}' -> focused shell", .{v.namespace});
-                broadcast(.{ .launcher_opened = {} });
             },
             .release_keyboard_focus => {
                 if (!request_keyboard_focus_active) {

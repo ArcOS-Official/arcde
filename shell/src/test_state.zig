@@ -172,15 +172,15 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
     try t.expectEqualStrings("main.zig - nvim", state.windows[0].title);
 
     // Shell registration: the worker declares the hub namespace on
-    // (re)connect so the compositor can focus it on MOD press.
+    // (re)connect so the compositor can focus it on MOD+/.
     tries = 0;
     while (!ctx.shell_registered.load(.seq_cst) and tries < 500) : (tries += 1) {
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     try t.expect(ctx.shell_registered.load(.seq_cst));
 
-    // Launcher pushes (compositor MOD tap) arm HubUi pending flags for
-    // hubFrame to consume — they must not disturb switcher/model state.
+    // Launcher pushes (compositor MOD+/ binding) arm HubUi pending flags
+    // for hubFrame to consume — they must not disturb switcher/model state.
     {
         var ev: proto.Event = .{ .launcher_opened = {} };
         defer ev.deinit(alloc);

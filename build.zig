@@ -307,6 +307,11 @@ fn buildShell(b: *std.Build, opts: ShellOptions) !void {
         .target = target,
         .optimize = optimize,
     });
+    // <systemd/sd-bus.h> pulls in glibc <fcntl.h>. With optimizations on,
+    // glibc activates its _FORTIFY_SOURCE open/openat wrappers, which
+    // translate-c cannot handle (bits/fcntl2.h __open_too_many_args errors).
+    // Disable fortify for the translation only; the final link is unaffected.
+    sd_bus_tc.defineCMacro("_FORTIFY_SOURCE", "0");
     const sd_bus_mod = sd_bus_tc.createModule();
     // Declarations only: must not pull -lc into the libc-free headless test
     // binaries. Final binaries link libc + systemd via their own modules.

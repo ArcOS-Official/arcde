@@ -103,6 +103,41 @@ needs_root() {
     return 1
 }
 
+# Resolve the zig binary. Plain `command -v zig` fails when PATH was reset
+# (e.g. sudo's secure_path) even though zig lives in the invoking user's
+# home (zvm, ~/.local/bin, ...). So also search $HOME and, when elevated
+# via sudo, the home of $SUDO_USER. $ZIG wins when set. Prints the path.
+find_zig() {
+    if [ -n "${ZIG:-}" ] && [ -x "$ZIG" ]; then
+        printf '%s\n' "$ZIG"
+        return 0
+    fi
+    if cmd_path="$(command -v zig 2>/dev/null)" && [ -x "$cmd_path" ]; then
+        printf '%s\n' "$cmd_path"
+        return 0
+    fi
+    homes="${HOME:-}"
+    if [ -n "${SUDO_USER:-}" ]; then
+        sudo_home=""
+        if command -v getent >/dev/null 2>&1; then
+            sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+        fi
+        if [ -z "$sudo_home" ]; then
+            sudo_home="/home/$SUDO_USER"
+        fi
+        homes="$homes $sudo_home"
+    fi
+    for h in $homes; do
+        for d in "$h/data/.zvm/bin" "$h/.zvm/bin" "$h/.local/bin" "$h/.cargo/bin"; do
+            if [ -x "$d/zig" ]; then
+                printf '%s\n' "$d/zig"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 if [ "$(id -u)" -ne 0 ] && needs_root; then
     if ! command -v sudo >/dev/null 2>&1; then
         echo "install.sh: $prefix is not writable (run as root or use --user)" >&2
@@ -115,8 +150,11 @@ if [ "$(id -u)" -ne 0 ] && needs_root; then
     [ "$uninstall" -eq 1 ] && elevate="$elevate --uninstall"
     [ "$xwayland" -eq 1 ] && elevate="$elevate --xwayland"
     [ "$optimize" != "ReleaseSafe" ] && elevate="$elevate --debug"
+    # Preserve PATH across elevation: sudo resets it to secure_path, which
+    # drops user-local zig installs (zvm, ~/.local/bin, ...). (No `--`
+    # here: it would be passed through to `env`, which rejects it.)
     # shellcheck disable=SC2086
-    exec sudo -- "$0" $elevate "$@"
+    exec sudo env "PATH=$PATH" "$0" $elevate "$@"
 fi
 
 if [ "$uninstall" -eq 1 ]; then
@@ -129,10 +167,12 @@ if [ "$uninstall" -eq 1 ]; then
     exit 0
 fi
 
-if ! command -v zig >/dev/null 2>&1; then
-    echo "install.sh: zig not found in PATH" >&2
+ZIG="$(find_zig)" || {
+    echo "install.sh: zig not found (searched PATH, \$HOME and \$SUDO_USER homes)" >&2
+    echo "  PATH=$PATH" >&2
+    echo "  hint: export PATH=\"\$HOME/data/.zvm/bin:\$PATH\", set ZIG=/path/to/zig, or use --user" >&2
     exit 1
-fi
+}
 
 # The shell links the ui/ DVUI fork: refuse with a hint instead of a
 # wall of missing-file errors when the submodule was never fetched.
@@ -152,7 +192,7 @@ if [ "$xwayland" -eq 1 ]; then
 fi
 
 # shellcheck disable=SC2086
-zig build $zig_build_args --prefix "$prefix" "$@"
+"$ZIG" build $zig_build_args --prefix "$prefix" "$@"
 
 mkdir -p "$bindir" "$sessiondir"
 install -m 0755 "$root/scripts/launch-arc" "$bindir/launch-arc"

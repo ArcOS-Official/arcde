@@ -1,0 +1,120 @@
+#!/bin/sh
+# launch-arc-dev: launch the arc session (nile compositor + nshell) from the
+# CURRENT checkout, for testing local changes.
+#
+# Works like scripts/launch-arc, except binary resolution prefers the
+# working tree's zig-out/bin over anything installed (e.g. /usr/local/bin),
+# so the session you get is the code you just edited — not last week's
+# install. Explicit ARC_NILE / ARC_NSHELL overrides still win.
+#
+# Usage: launch-arc-dev [--build] [nile args...]
+#   --build        run `zig build` first so zig-out matches the tree.
+#                  (Or set ARC_BUILD=1.) Aborts if the build fails.
+#   Extra args pass straight to nile (e.g. -log-level debug).
+#   ARC_CMD overrides the startup command (default: nshell).
+#   ARC_NILE / ARC_NSHELL override binary resolution entirely.
+#
+# Without --build the script launches whatever is in zig-out/bin and warns
+# if any source file is newer than the binaries (i.e. you forgot to build).
+#
+# Like launch-arc, this script execs nile, so signals go to the compositor.
+set -eu
+
+root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+
+# Detect --build anywhere in argv and rebuild "$@" without it,
+# preserving quoting (nile args may contain spaces).
+build_first=0
+if [ "${ARC_BUILD:-0}" = "1" ]; then
+    build_first=1
+fi
+filtered_count=0
+for arg in "$@"; do
+    if [ "$arg" = "--build" ]; then
+        build_first=1
+    else
+        filtered_count=$((filtered_count + 1))
+        eval "filtered_$filtered_count=\"\$arg\""
+    fi
+done
+set --
+i=1
+while [ "$i" -le "$filtered_count" ]; do
+    eval "set -- \"\$@\" \"\$filtered_$i\""
+    i=$((i + 1))
+done
+unset i filtered_count arg
+# (filtered_N vars linger harmlessly in this short-lived script.)
+
+if [ "$build_first" = "1" ]; then
+    echo "launch-arc-dev: building current tree..." >&2
+    (cd "$root" && zig build) || {
+        echo "launch-arc-dev: zig build failed, not launching" >&2
+        exit 1
+    }
+fi
+
+resolve() {
+    name="$1"
+    override="$2"
+    if [ -n "$override" ] && [ -x "$override" ]; then
+        printf '%s\n' "$override"
+        return 0
+    fi
+    # Current code first: the working tree beats any install.
+    if [ -x "$root/zig-out/bin/$name" ]; then
+        printf '%s\n' "$root/zig-out/bin/$name"
+        return 0
+    fi
+    if cmd_path="$(command -v "$name" 2>/dev/null)" && [ -x "$cmd_path" ]; then
+        printf '%s\n' "$cmd_path"
+        return 0
+    fi
+    return 1
+}
+
+nile="$(resolve nile "${ARC_NILE:-}")" || {
+    echo "launch-arc-dev: nile not found (run with --build, or set ARC_NILE)" >&2
+    exit 1
+}
+nshell="$(resolve nshell "${ARC_NSHELL:-}")" || {
+    echo "launch-arc-dev: nshell not found (run with --build, or set ARC_NSHELL)" >&2
+    exit 1
+}
+
+# Warn when the tree is newer than the binaries we are about to run.
+if [ -z "${ARC_NILE:-}" ] || [ -z "${ARC_NSHELL:-}" ]; then
+    stale=""
+    for bin in "$nile" "$nshell"; do
+        case "$bin" in
+            "$root/zig-out/bin/"*)
+                if [ -n "$(find "$root/compositor/src" "$root/shell/src" "$root/bank/src" "$root/ui/src" "$root/build.zig" "$root/build.zig.zon" -type f -newer "$bin" 2>/dev/null | head -1)" ]; then
+                    stale="$stale $(basename "$bin")"
+                fi
+                ;;
+        esac
+    done
+    if [ -n "$stale" ]; then
+        echo "launch-arc-dev: warning: sources are newer than$stale — relaunch with --build to test current code" >&2
+    fi
+fi
+
+# Wayland clients (and wlroots) require XDG_RUNTIME_DIR. Logind normally
+# provides /run/user/$UID; fall back to a private dir under /tmp.
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    if [ -d "/run/user/$(id -u)" ]; then
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    else
+        export XDG_RUNTIME_DIR="/tmp/arc-runtime-$(id -u)"
+        mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
+    fi
+fi
+
+if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+    echo "launch-arc-dev: warning: WAYLAND_DISPLAY/DISPLAY already set, session will nest" >&2
+fi
+
+echo "launch-arc-dev: nile=$nile" >&2
+echo "launch-arc-dev: nshell=$nshell" >&2
+cmd="${ARC_CMD:-$nshell}"
+exec "$nile" -c "$cmd" "$@"

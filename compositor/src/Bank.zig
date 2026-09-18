@@ -981,7 +981,12 @@ pub fn requestPrevWindow() ?*Window {
 }
 
 fn findLayerSurfaceByNamespace(namespace: []const u8) ?*LayerSurface {
-    for ([_]zwlr.LayerShellV1.Layer{ .overlay, .top }) |layer| {
+    // Background window handling: search every layer so background
+    // surfaces (e.g. nshell-wallpaper) resolve by namespace too.
+    // request_keyboard_focus still rejects non-shell namespaces via
+    // ShellDomain.resolveRequestTarget, so this never grants wallpaper
+    // keyboard focus — it just makes the lookup total.
+    for ([_]zwlr.LayerShellV1.Layer{ .overlay, .top, .bottom, .background }) |layer| {
         const tree = server.scene.layerSurfaceTree(layer);
         var it = tree.children.iterator(.reverse);
         while (it.next()) |node| {

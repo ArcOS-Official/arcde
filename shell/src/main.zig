@@ -4,6 +4,7 @@ const ls = @import("layershell");
 const State = @import("State.zig");
 const HubUi = @import("HubUi.zig");
 const Icons = @import("Icons.zig");
+const Wallpaper = @import("Wallpaper.zig");
 const event_pump = @import("event_pump.zig");
 
 pub const panic = dvui.App.panic;
@@ -25,9 +26,39 @@ fn requestDvuiRefresh(ctx: ?*anyopaque) void {
     }
 }
 
-// Single shared pump for both layer-shell windows; see event_pump.zig.
+// Single shared pump for the shell's layer-shell windows; see event_pump.zig.
+// Two-window path (bar + hub) when no wallpaper exists; three-window path
+// once the background surface is mapped.
 fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_hub: anytype) !void {
     return event_pump.pumpEvents(backend_bar, win_bar, backend_hub, win_hub);
+}
+
+fn pumpEvents3(
+    backend_bar: anytype,
+    win_bar: anytype,
+    backend_hub: anytype,
+    win_hub: anytype,
+    backend_bg: anytype,
+    win_bg: anytype,
+) !void {
+    return event_pump.pumpEvents3(backend_bar, win_bar, backend_hub, win_hub, backend_bg, win_bg);
+}
+
+// Background wallpaper frame: fullscreen image covering the output.
+// Bytes borrow the loaded wallpaper buffer (stable for the process
+// lifetime); dvui caches the texture by pointer.
+fn wallpaperFrame(wallpaper_bytes: []const u8) !dvui.App.Result {
+    var outer = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .both,
+        .background = false,
+    });
+    defer outer.deinit();
+    _ = dvui.image(@src(), .{
+        .source = .{ .imageFile = .{ .bytes = wallpaper_bytes, .name = "wallpaper" } },
+    }, .{
+        .expand = .both,
+    });
+    return .ok;
 }
 
 // Authoritative hub keyboard (input) focus now comes from the compositor:
@@ -43,6 +74,9 @@ const LayerShellWindow = @typeInfo(@TypeOf(ls.initWindow)).@"fn".return_type.?;
 
 var win_hub_g: *dvui.Window = undefined;
 var win_bar_g: *dvui.Window = undefined;
+// Set when the wallpaper surface exists; the fallback refresher wakes it
+// alongside bar/hub so the background converges without input events.
+var win_bg_g: ?*dvui.Window = null;
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -93,6 +127,62 @@ pub fn main(init: std.process.Init) !u8 {
     defer backend_hub.deinit();
     defer ctx_hub.waylandCtx.deinit(gpa);
 
+    // Background wallpaper surface: fullscreen background layer showing
+    // ~/Pictures/wallpaper.png when it exists. Opaque, no keyboard focus,
+    // exclusive_zone=-1 so it stretches under panels. Missing/unreadable
+    // file (or a failed surface): no background window, shell runs on.
+    const wallpaper_bytes: ?[]u8 = blk: {
+        const home = init.environ_map.get("HOME");
+        const path = Wallpaper.wallpaperPath(gpa, home) catch null;
+        if (path) |p| {
+            defer gpa.free(p);
+            break :blk Wallpaper.loadWallpaperBytes(gpa, io, p);
+        }
+        break :blk null;
+    };
+    defer if (wallpaper_bytes) |b| gpa.free(b);
+    if (wallpaper_bytes) |b| {
+        std.log.info("wallpaper: loaded {d} bytes", .{b.len});
+    } else {
+        std.log.info("wallpaper: ~/Pictures/wallpaper.png not found, no background window", .{});
+    }
+
+    const BackendT = @TypeOf(backend_bar);
+    var backend_bg: ?BackendT = null;
+    defer if (backend_bg) |*b| b.deinit();
+    const WaylandCtxT = @TypeOf(ctx_bar.waylandCtx.*);
+    var wayland_bg: ?*WaylandCtxT = null;
+    defer if (wayland_bg) |wc| wc.deinit(gpa);
+    var have_bg = false;
+    if (wallpaper_bytes != null) {
+        const ctx_bg = ls.initWindow(.{
+            .io = io,
+            .environ_map = init.environ_map,
+            .size = .{ .w = 1280, .h = 720 },
+            .title = "nshell-wallpaper",
+            .transparent = false,
+            .persist_window_geometry = false,
+            .vsync = true,
+        }, .{
+            .anchors = .{ .top, .left, .right, .bottom },
+            .layer = .background,
+            .exclusive_zone = -1,
+            .namespace = State.wallpaper_namespace,
+            .keyboard_interactivity = .none,
+        }, gpa) catch |e| blk: {
+            std.log.warn("wallpaper: background surface failed: {s}, continuing without it", .{@errorName(e)});
+            break :blk null;
+        };
+        if (ctx_bg) |*c| {
+            // initWindow returns a value; copy its fields out (same shape
+            // as ctx_bar/ctx_hub) so optionals own them.
+            backend_bg = c.backend;
+            backend_bg.?.sdl_quit = false;
+            wayland_bg = c.waylandCtx;
+            have_bg = true;
+        }
+    }
+
     const C = @TypeOf(backend_bar).c;
     _ = C.SDL_EnableScreenSaver();
 
@@ -120,6 +210,19 @@ pub fn main(init: std.process.Init) !u8 {
     defer win_hub.deinit();
     hub_ui = HubUi.init();
 
+    // Background dvui window shares the panel theme; the wallpaper image
+    // covers it fully so the fill never shows.
+    var bg_open = true;
+    var win_bg: ?dvui.Window = null;
+    defer if (win_bg) |*w| w.deinit();
+    if (have_bg) {
+        win_bg = try dvui.Window.init(@src(), gpa, backend_bg.?.backend(), .{
+            .theme = theme,
+        });
+        win_bg.?.open_flag = &bg_open;
+        win_bg_g = &win_bg.?;
+    }
+
     try state.initWithWakeup(gpa, io, &win_bar, &requestDvuiRefresh);
     defer state.deinit();
     // Worker-driven focus: compositor pushes store straight into the hub
@@ -139,7 +242,7 @@ pub fn main(init: std.process.Init) !u8 {
                 // Fallback wakeup on the shared Net cadence: worker pushes
                 // already wake the loop on change, but snapshots also need
                 // to flow (and spinners/animations need frames) when
-                // nothing pushes. Matches HubUi's steady panel timer. Both
+                // nothing pushes. Matches HubUi's steady panel timer. All
                 // windows refresh: the bar carries live speed/battery/bell
                 // values that would otherwise stale between input events.
                 io_.sleep(.fromMilliseconds(@intCast(State.Net.refresh_ms)), .awake) catch {
@@ -147,22 +250,30 @@ pub fn main(init: std.process.Init) !u8 {
                 };
                 dvui.refresh(win_hub_g, @src(), null);
                 dvui.refresh(win_bar_g, @src(), null);
+                if (win_bg_g) |w| dvui.refresh(w, @src(), null);
             }
         }
     }.refresh, .{io});
     defer ref.cancel(io);
 
     var interrupted = false;
-    // Single app lifetime: closing either window tears down both surfaces.
-    // (Per-window lifetimes would leave the other layer surface mapped with
-    // a frozen last frame after this function returns one window's defers.)
-    while (bar_open and hub_open) {
+    // Single app lifetime: closing any window tears down all surfaces.
+    // (Per-window lifetimes would leave the other layer surfaces mapped
+    // with a frozen last frame after this function returns one window's
+    // defers.)
+    while (bar_open and hub_open and (!have_bg or bg_open)) {
         if (ctx_bar.waylandCtx.should_close or ctx_hub.waylandCtx.should_close) break;
+        if (have_bg and wayland_bg.?.should_close) break;
 
         const t_bar = if (bar_open) win_bar.beginWait(interrupted) else 0;
         const t_hub = if (hub_open) win_hub.beginWait(interrupted) else 0;
+        const t_bg: i128 = if (have_bg and bg_open) win_bg.?.beginWait(interrupted) else 0;
 
-        try pumpEvents(&backend_bar, &win_bar, &backend_hub, &win_hub);
+        if (have_bg) {
+            try pumpEvents3(&backend_bar, &win_bar, &backend_hub, &win_hub, &backend_bg.?, &win_bg.?);
+        } else {
+            try pumpEvents(&backend_bar, &win_bar, &backend_hub, &win_hub);
+        }
 
         var end_bar: ?u32 = null;
         if (bar_open) {
@@ -178,11 +289,20 @@ pub fn main(init: std.process.Init) !u8 {
             end_hub = try win_hub.end(.{});
         }
 
+        var end_bg: ?u32 = null;
+        if (have_bg and bg_open) {
+            try win_bg.?.begin(t_bg);
+            _ = try wallpaperFrame(wallpaper_bytes.?);
+            end_bg = try win_bg.?.end(.{});
+        }
+
         if (!bar_open or !hub_open) break;
+        if (have_bg and !bg_open) break;
 
         const wait_bar = if (bar_open) win_bar.waitTime(end_bar) else std.math.maxInt(u32);
         const wait_hub = if (hub_open) win_hub.waitTime(end_hub) else std.math.maxInt(u32);
-        interrupted = try backend_bar.waitEventTimeout(@min(wait_bar, wait_hub));
+        const wait_bg = if (have_bg and bg_open) win_bg.?.waitTime(end_bg) else std.math.maxInt(u32);
+        interrupted = try backend_bar.waitEventTimeout(@min(wait_bar, @min(wait_hub, wait_bg)));
     }
     return 0;
 }

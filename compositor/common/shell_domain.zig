@@ -19,12 +19,31 @@ const std = @import("std");
 /// constants (shell/src/State.zig: shell_namespace/bar_namespace).
 pub const namespaces = [_][]const u8{ "nshell", "nshell-hub" };
 
+/// Background wallpaper namespace. Mirrors the shell's own constant
+/// (shell/src/State.zig: wallpaper_namespace). The wallpaper lives on
+/// the background layer with keyboard_interactivity=none: it never
+/// takes keyboard focus and never counts as shell focus. Tracked
+/// separately from `namespaces` so shell-focus predicates stay false
+/// for it while background-click handling can still recognize it.
+pub const wallpaper_namespace: []const u8 = "nshell-wallpaper";
+
 /// True when a layer namespace belongs to the shell domain.
 pub fn isShellNamespace(ns: []const u8) bool {
     for (namespaces) |known| {
         if (std.mem.eql(u8, known, ns)) return true;
     }
     return false;
+}
+
+/// True when a layer namespace is the shell's background wallpaper.
+pub fn isBackgroundNamespace(ns: []const u8) bool {
+    return std.mem.eql(u8, ns, wallpaper_namespace);
+}
+
+/// True when a layer namespace is any shell-owned surface (interactive
+/// domain or background wallpaper).
+pub fn isShellOwnedNamespace(ns: []const u8) bool {
+    return isShellNamespace(ns) or isBackgroundNamespace(ns);
 }
 
 /// Where a request_keyboard_focus call may land. Pure so both the
@@ -71,4 +90,15 @@ test "overlay visibility over fullscreen" {
     try std.testing.expect(overlayVisible(false, true));
     try std.testing.expect(!overlayVisible(true, false));
     try std.testing.expect(overlayVisible(true, true));
+}
+
+test "background namespace is not shell focus" {
+    try std.testing.expect(isBackgroundNamespace("nshell-wallpaper"));
+    try std.testing.expect(!isBackgroundNamespace("nshell"));
+    try std.testing.expect(!isBackgroundNamespace("nshell-hub"));
+    try std.testing.expect(!isShellNamespace("nshell-wallpaper"));
+    try std.testing.expect(isShellOwnedNamespace("nshell"));
+    try std.testing.expect(isShellOwnedNamespace("nshell-hub"));
+    try std.testing.expect(isShellOwnedNamespace("nshell-wallpaper"));
+    try std.testing.expect(!isShellOwnedNamespace("firefox"));
 }

@@ -773,9 +773,44 @@ fn interact(cursor: Cursor, result: Scene.AtResult) void {
             cursor.seat.focus(.{ .lock_surface = lock_surface });
         },
         .layer_surface => |layer_surface| {
+            const wlr_layer = layer_surface.wlr_layer_surface;
+            // Background window handling: background/bottom layers never
+            // steal keyboard focus for shell panels. A background surface
+            // that wants keys (on_demand/exclusive) gets normal focus
+            // semantics; one with .none (e.g. the nshell-wallpaper image)
+            // clears a focused window instead, so clicking the desktop
+            // drops focus rather than leaving it stuck on a hidden app.
+            // Exclusive top/overlay focus always wins: never disturb it.
+            const is_background = wlr_layer.current.layer == .background or
+                wlr_layer.current.layer == .bottom;
+            if (is_background) {
+                switch (cursor.seat.layer_shell.scheduled.focus) {
+                    .exclusive => {},
+                    .none, .non_exclusive => {
+                        switch (wlr_layer.current.keyboard_interactive) {
+                            .none => {
+                                // Only clear window focus; leave an existing
+                                // layer focus (bar/hub panel) alone.
+                                if (cursor.seat.focused == .window) {
+                                    cursor.seat.wm_requested.focus = .clear;
+                                    server.wm.dirtyWindowing();
+                                }
+                            },
+                            .on_demand, .exclusive => {
+                                cursor.seat.layer_shell.scheduled.focus = .{
+                                    .non_exclusive = layer_surface.ref,
+                                };
+                                server.wm.dirtyWindowing();
+                            },
+                            else => {},
+                        }
+                    },
+                }
+                return;
+            }
             switch (cursor.seat.layer_shell.scheduled.focus) {
                 .none, .non_exclusive => {
-                    if (layer_surface.wlr_layer_surface.current.keyboard_interactive == .on_demand) {
+                    if (wlr_layer.current.keyboard_interactive == .on_demand) {
                         cursor.seat.layer_shell.scheduled.focus = .{
                             .non_exclusive = layer_surface.ref,
                         };

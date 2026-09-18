@@ -21,6 +21,13 @@ pub const shell_namespace = "nshell-hub";
 // shared domain as the hub: focusing one focuses the domain.
 pub const bar_namespace = "nshell";
 
+// Namespace of the background wallpaper layer surface (see main.zig).
+// Mirrors compositor/common/shell_domain.zig: wallpaper_namespace.
+// Background layer, keyboard_interactivity=none: never takes keyboard
+// focus and never counts as shell focus. Only spawned when
+// ~/Pictures/wallpaper.png exists.
+pub const wallpaper_namespace = "nshell-wallpaper";
+
 // Request/response socket served by the compositor (`Bank.socket_id = "compositor"`).
 // The same connection doubles as the push channel: the server broadcasts
 // unsolicited events (`Header.push_id`) over it, and nilebank's reader fiber

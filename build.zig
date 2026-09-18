@@ -431,6 +431,21 @@ fn buildShell(b: *std.Build, opts: ShellOptions) !void {
     opts.test_step.dependOn(&b.addRunArtifact(launcher_tests).step);
     opts.check_step.dependOn(&launcher_tests.step);
 
+    // Wallpaper helper tests — pure std, no dvui/SDL link.
+    {
+        const wallpaper_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_dir ++ "/Wallpaper.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .use_llvm = opts.use_llvm,
+            .use_lld = opts.use_lld,
+        });
+        opts.test_step.dependOn(&b.addRunArtifact(wallpaper_tests).step);
+        opts.check_step.dependOn(&wallpaper_tests.step);
+    }
+
     // Headless HubUi logic tests (JSON scenarios in shell/test) — link-light
     // via dvui_shim; @import("tabler") resolves to the tabler shim.
     const tabler_shim = b.createModule(.{

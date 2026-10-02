@@ -152,6 +152,39 @@ pub const compositor = struct {
         floating = 1,
     };
 
+    /// What a shareable view refers to. Output and Window ids live in
+    /// separate compositor id spaces (`Output.id` is a pointer value,
+    /// `Window.id` packs generation+index), so every share message carries
+    /// this alongside the id.
+    pub const ShareKind = enum(u8) {
+        screen = 0,
+        window = 1,
+    };
+
+    /// One hideable sub-view of a share source: a window sitting on the
+    /// shared screen that the user may opt to black-box. Only produced for
+    /// a `screen` source — a shared window has nothing to hide inside it.
+    pub const ShareItem = struct {
+        id: u64 = 0,
+        title: []const u8 = "",
+
+        pub fn deinit(self: ShareItem, alloc: Allocator) void {
+            if (self.title.len > 0) alloc.free(self.title);
+        }
+
+        pub fn encodeAlloc(self: ShareItem, alloc: Allocator, list: *std.ArrayList(u8)) !void {
+            try wire.writeU64BE(list, alloc, self.id);
+            try wire.writeString(list, alloc, self.title);
+        }
+
+        pub fn decodeAlloc(reader: *wire.Reader, alloc: Allocator) !ShareItem {
+            const id = try reader.readU64BE();
+            const title = try reader.readString(alloc);
+            errdefer if (title.len > 0) alloc.free(title);
+            return .{ .id = id, .title = title };
+        }
+    };
+
     pub const Workspace = struct {
         id: u64 = 0,
         number: u8 = 0,
@@ -495,6 +528,28 @@ pub const compositor = struct {
             try writeSliceHeader(list, alloc, @intCast(windows.len));
             for (windows) |w| try w.encodeAlloc(alloc, list);
         }
+        pub fn encodeShareItemList(alloc: Allocator, items: []const ShareItem, list: *std.ArrayList(u8)) !void {
+            try writeSliceHeader(list, alloc, @intCast(items.len));
+            for (items) |it| try it.encodeAlloc(alloc, list);
+        }
+        /// Caller owns the returned slice and must free every title too.
+        pub fn decodeShareItemList(reader: *Reader, alloc: Allocator) ![]ShareItem {
+            const count = try reader.readSliceHeader();
+            const arr = try alloc.alloc(ShareItem, count);
+            errdefer alloc.free(arr);
+            var filled: usize = 0;
+            errdefer {
+                for (arr[0..filled]) |it| it.deinit(alloc);
+            }
+            while (filled < count) : (filled += 1) {
+                arr[filled] = try ShareItem.decodeAlloc(reader, alloc);
+            }
+            return arr;
+        }
+        pub fn freeShareItemList(items: []ShareItem, alloc: Allocator) void {
+            for (items) |it| it.deinit(alloc);
+            if (items.len > 0) alloc.free(items);
+        }
         pub fn decodeWindowList(reader: *Reader, alloc: Allocator) ![]Window {
             const count = try reader.readSliceHeader();
             var arr = try alloc.alloc(Window, count);
@@ -538,7 +593,7 @@ pub const compositor = struct {
     }
     pub fn encodingForEvent(tag: EventTag) Encoding {
         return switch (tag) {
-            .windows, .windows_snapshot, .outputs, .outputs_snapshot, .workspaces, .workspaces_snapshot, .full_image, .window_image, .output_image => .deflate,
+            .windows, .windows_snapshot, .outputs, .outputs_snapshot, .workspaces, .workspaces_snapshot, .full_image, .window_image, .output_image, .share_frame => .deflate,
             else => .raw,
         };
     }
@@ -600,6 +655,21 @@ pub const compositor = struct {
         release_keyboard_focus = 0x4B,
         set_window_fullscreen = 0x4C,
         exit_session = 0x4D,
+        // --- screen share (see ShareKind) ---
+        /// Confirm the share the user configured: start streaming `id`
+        /// (a screen or a window) with `hidden` windows black-boxed.
+        share_configured = 0x4E,
+        /// Stop the active share.
+        share_stop = 0x4F,
+        /// Toggle one window's share-hidden flag, including mid-share.
+        set_share_hidden = 0x50,
+        /// The user picked a view in the share picker. Answered with a
+        /// `configure_share` event carrying the sub-views to offer.
+        share_select = 0x51,
+        /// Ask for one composed share frame (diagnostics: lets a client check
+        /// the image, and that a hidden window really is redacted, without
+        /// standing up a PipeWire consumer).
+        share_snapshot = 0x52,
     };
 
     pub const Request = union(RequestTag) {
@@ -632,6 +702,11 @@ pub const compositor = struct {
         release_keyboard_focus: void,
         set_window_fullscreen: SetWindowFullscreen,
         exit_session: void,
+        share_configured: ShareConfigured,
+        share_stop: void,
+        set_share_hidden: SetShareHidden,
+        share_select: ShareSelect,
+        share_snapshot: ShareSnapshot,
 
         // payload structs
         pub const WindowImageReq = struct {
@@ -665,12 +740,28 @@ pub const compositor = struct {
         pub const SetFocusConfig = struct { switch_workspace_on_focus: bool };
         pub const RequestKeyboardFocus = struct { namespace: []const u8 };
         pub const SetWindowFullscreen = struct { id: u64, fullscreen: bool };
+        /// Confirmed share configuration. `hidden` lists window ids the user
+        /// chose to black-box; it replaces the compositor's whole hidden set
+        /// rather than toggling, so a re-confirm can't leave stale entries.
+        /// Owned: deinit frees the slice.
+        pub const ShareConfigured = struct {
+            kind: ShareKind = .screen,
+            id: u64 = 0,
+            hidden: []u64 = &.{},
+        };
+        pub const SetShareHidden = struct { id: u64, hidden: bool };
+        pub const ShareSnapshot = struct { serial: u64 = 0 };
+        pub const ShareSelect = struct {
+            kind: ShareKind = .screen,
+            id: u64 = 0,
+        };
 
         pub fn deinit(self: Request, alloc: Allocator) void {
             switch (self) {
                 .set_workspace_name => |v| if (v.name.len > 0) alloc.free(v.name),
                 .shell_register => |v| if (v.namespace.len > 0) alloc.free(v.namespace),
                 .request_keyboard_focus => |v| if (v.namespace.len > 0) alloc.free(v.namespace),
+                .share_configured => |v| if (v.hidden.len > 0) alloc.free(v.hidden),
                 else => {},
             }
         }
@@ -738,6 +829,22 @@ pub const compositor = struct {
                     try wire.writeU64BE(&list, alloc, v.id);
                     try wire.writeBool(&list, alloc, v.fullscreen);
                 },
+                .share_configured => |v| {
+                    try wire.writeU8(&list, alloc, @intFromEnum(v.kind));
+                    try wire.writeU64BE(&list, alloc, v.id);
+                    try wire.writeSliceHeader(&list, alloc, @intCast(v.hidden.len));
+                    for (v.hidden) |h| try wire.writeU64BE(&list, alloc, h);
+                },
+                .share_stop => {},
+                .set_share_hidden => |v| {
+                    try wire.writeU64BE(&list, alloc, v.id);
+                    try wire.writeBool(&list, alloc, v.hidden);
+                },
+                .share_select => |v| {
+                    try wire.writeU8(&list, alloc, @intFromEnum(v.kind));
+                    try wire.writeU64BE(&list, alloc, v.id);
+                },
+                .share_snapshot => |v| try wire.writeU64BE(&list, alloc, v.serial),
             }
             return list.toOwnedSlice(alloc);
         }
@@ -907,6 +1014,57 @@ pub const compositor = struct {
                     if (!r.eof()) return error.InvalidData;
                     return .{ .set_window_fullscreen = .{ .id = id, .fullscreen = fullscreen } };
                 },
+                .share_configured => {
+                    const kind_raw = try r.readU8();
+                    const id = try r.readU64BE();
+                    const count = try r.readSliceHeader();
+                    const hidden = try alloc.alloc(u64, count);
+                    errdefer alloc.free(hidden);
+                    for (hidden) |*h| h.* = try r.readU64BE();
+                    if (!r.eof()) {
+                        alloc.free(hidden);
+                        return error.InvalidData;
+                    }
+                    return .{
+                        .share_configured = .{
+                            // Unknown kinds are refused rather than coerced:
+                            // a mis-decode here would start streaming the
+                            // wrong thing.
+                            .kind = std.enums.fromInt(ShareKind, kind_raw) orelse {
+                                alloc.free(hidden);
+                                return error.InvalidData;
+                            },
+                            .id = id,
+                            .hidden = hidden,
+                        },
+                    };
+                },
+                .share_stop => {
+                    if (!r.eof()) return error.InvalidData;
+                    return .{ .share_stop = {} };
+                },
+                .set_share_hidden => {
+                    const id = try r.readU64BE();
+                    const hidden = try r.readBool();
+                    if (!r.eof()) return error.InvalidData;
+                    return .{ .set_share_hidden = .{ .id = id, .hidden = hidden } };
+                },
+                .share_select => {
+                    const kind_raw = try r.readU8();
+                    const id = try r.readU64BE();
+                    if (!r.eof()) return error.InvalidData;
+                    return .{
+                        .share_select = .{
+                            .kind = std.enums.fromInt(ShareKind, kind_raw) orelse return error.InvalidData,
+                            .id = id,
+                        },
+                    };
+                },
+                .share_snapshot => {
+                    const serial = try r.readU64BE();
+                    if (!r.eof()) return error.InvalidData;
+                    return .{ .share_snapshot = .{ .serial = serial } };
+                },
             }
         }
 
@@ -1030,6 +1188,21 @@ pub const compositor = struct {
         window_floating_changed = 0x23,
         shell_focus_changed = 0x24,
         logout_prompt = 0x25,
+        // --- screen share ---
+        /// The user picked a view in the share picker; the shell should open
+        /// the config menu. `items` are the windows on that view the user
+        /// may hide (empty for a window source).
+        configure_share = 0x26,
+        /// A share is live. `node_id` is the PipeWire node the recipient's
+        /// app connects to.
+        share_started = 0x27,
+        /// The active share ended (user stopped it, or the client left).
+        share_stopped = 0x28,
+        /// Reply to `share_snapshot`: the composed share image as RGBA.
+        /// Broadcast rather than a correlated reply because it must be
+        /// produced on the compositor's main thread; `serial` echoes the
+        /// request so a client can match it.
+        share_frame = 0x29,
     };
 
     pub const Event = union(EventTag) {
@@ -1070,6 +1243,10 @@ pub const compositor = struct {
         window_floating_changed: WindowFloatingChanged,
         shell_focus_changed: ShellFocusChanged,
         logout_prompt: void,
+        configure_share: ConfigureShare,
+        share_started: ShareStarted,
+        share_stopped: void,
+        share_frame: ShareFrame,
 
         // payload aliases for compat
         pub const NewWindow = struct {
@@ -1108,6 +1285,28 @@ pub const compositor = struct {
         pub const WorkspaceModeChanged = struct { id: u64, mode: WorkspaceMode };
         pub const WindowFloatingChanged = struct { id: u64, floating: bool };
         pub const ShellFocusChanged = struct { focused: bool };
+        /// Picked view + its hideable sub-views. `items` is owned and
+        /// freed by Event.deinit.
+        pub const ConfigureShare = struct {
+            kind: ShareKind = .screen,
+            id: u64 = 0,
+            items: []ShareItem = &.{},
+        };
+        /// One composed share frame, in the same RGBA8 shape as
+        /// `WindowImage` / `OutputImage` so viewers can reuse that path.
+        pub const ShareFrame = struct {
+            serial: u64 = 0,
+            image: Image = .{},
+        };
+        pub const ShareStarted = struct {
+            node_id: u32 = 0,
+            kind: ShareKind = .screen,
+            id: u64 = 0,
+        };
+
+        pub fn deinitFreeShareItems(items: []ShareItem, alloc: Allocator) void {
+            wire.freeShareItemList(items, alloc);
+        }
 
         pub fn deinit(self: Event, alloc: Allocator) void {
             switch (self) {
@@ -1146,6 +1345,8 @@ pub const compositor = struct {
                 .output_added => |v| v.deinit(alloc),
                 .output_changed => |v| v.deinit(alloc),
                 .workspace_created => |v| v.deinit(alloc),
+                .configure_share => |v| wire.freeShareItemList(v.items, alloc),
+                .share_frame => |v| v.image.deinit(alloc),
                 else => {},
             }
         }
@@ -1222,6 +1423,21 @@ pub const compositor = struct {
                 .pong => |v| try wire.writeU64BE(&list, alloc, v.nonce),
                 .launcher_opened, .launcher_closed => {},
                 .logout_prompt => {},
+                .configure_share => |v| {
+                    try wire.writeU8(&list, alloc, @intFromEnum(v.kind));
+                    try wire.writeU64BE(&list, alloc, v.id);
+                    try wire.encodeShareItemList(alloc, v.items, &list);
+                },
+                .share_started => |v| {
+                    try wire.writeU32BE(&list, alloc, v.node_id);
+                    try wire.writeU8(&list, alloc, @intFromEnum(v.kind));
+                    try wire.writeU64BE(&list, alloc, v.id);
+                },
+                .share_stopped => {},
+                .share_frame => |v| {
+                    try wire.writeU64BE(&list, alloc, v.serial);
+                    try v.image.encodeAlloc(alloc, &list);
+                },
                 .switcher_opened, .switcher_closed => {},
                 .workspace_mode_changed => |v| {
                     try wire.writeU64BE(&list, alloc, v.id);
@@ -1472,6 +1688,38 @@ pub const compositor = struct {
                 .logout_prompt => {
                     if (!r.eof()) return error.InvalidData;
                     return .{ .logout_prompt = {} };
+                },
+                .configure_share => {
+                    const kind_raw = try r.readU8();
+                    const parsed_kind = std.enums.fromInt(ShareKind, kind_raw) orelse return error.InvalidData;
+                    const id = try r.readU64BE();
+                    const items = try wire.decodeShareItemList(&r, alloc);
+                    if (!r.eof()) {
+                        wire.freeShareItemList(items, alloc);
+                        return error.InvalidData;
+                    }
+                    return .{ .configure_share = .{ .kind = parsed_kind, .id = id, .items = items } };
+                },
+                .share_started => {
+                    const node_id = try r.readU32BE();
+                    const kind_raw = try r.readU8();
+                    const parsed_kind = std.enums.fromInt(ShareKind, kind_raw) orelse return error.InvalidData;
+                    const id = try r.readU64BE();
+                    if (!r.eof()) return error.InvalidData;
+                    return .{ .share_started = .{ .node_id = node_id, .kind = parsed_kind, .id = id } };
+                },
+                .share_stopped => {
+                    if (!r.eof()) return error.InvalidData;
+                    return .{ .share_stopped = {} };
+                },
+                .share_frame => {
+                    const serial = try r.readU64BE();
+                    const image = try Image.decodeAlloc(&r, alloc);
+                    if (!r.eof()) {
+                        image.deinit(alloc);
+                        return error.InvalidData;
+                    }
+                    return .{ .share_frame = .{ .serial = serial, .image = image } };
                 },
                 .workspace_mode_changed => {
                     const id = try r.readU64BE();
@@ -1859,4 +2107,103 @@ test "compositor legacy Window literal compat" {
     // Workspace legacy
     const ws: compositor.Workspace = .{ .active = true, .current = false, .number = 2 };
     try t.expectEqual(true, ws.active);
+}
+
+test "share protocol roundtrip" {
+    const t = std.testing;
+    const alloc = t.allocator;
+
+    // --- Requests: shell -> compositor ---
+    var h1: [1]u64 = .{42};
+    var h3: [3]u64 = .{ 1, 2, 3 };
+    const reqs = [_]compositor.Request{
+        .{ .share_select = .{ .kind = .screen, .id = 0x1000 } },
+        .{ .share_select = .{ .kind = .window, .id = 0x2000 } },
+        .{ .share_configured = .{ .kind = .screen, .id = 7, .hidden = &.{} } },
+        .{ .share_configured = .{ .kind = .screen, .id = 7, .hidden = h3[0..] } },
+        .{ .share_configured = .{ .kind = .window, .id = 9, .hidden = h1[0..] } },
+        .{ .share_stop = {} },
+        .{ .set_share_hidden = .{ .id = 5, .hidden = true } },
+        .{ .set_share_hidden = .{ .id = 5, .hidden = false } },
+    };
+    for (reqs) |req| {
+        const k = req.kind();
+        const data = try req.encodeAlloc(alloc, .raw);
+        defer alloc.free(data);
+        const dec = try compositor.Request.decodeAllocWith(alloc, k, data, .raw);
+        defer dec.deinit(alloc);
+        try t.expectEqual(k, dec.kind());
+        switch (req) {
+            .share_select => |v| {
+                try t.expectEqual(v.kind, dec.share_select.kind);
+                try t.expectEqual(v.id, dec.share_select.id);
+            },
+            .share_configured => |v| {
+                try t.expectEqual(v.kind, dec.share_configured.kind);
+                try t.expectEqual(v.id, dec.share_configured.id);
+                try t.expectEqual(v.hidden.len, dec.share_configured.hidden.len);
+                for (v.hidden, dec.share_configured.hidden) |a, b| try t.expectEqual(a, b);
+            },
+            .set_share_hidden => |v| {
+                try t.expectEqual(v.id, dec.set_share_hidden.id);
+                try t.expectEqual(v.hidden, dec.set_share_hidden.hidden);
+            },
+            else => {},
+        }
+    }
+
+    // --- Events: compositor -> shell ---
+    var items = [_]compositor.ShareItem{
+        .{ .id = 1, .title = "one" },
+        .{ .id = 2, .title = "" },
+    };
+    const evs = [_]compositor.Event{
+        .{ .configure_share = .{ .kind = .screen, .id = 3, .items = items[0..] } },
+        // A shared window offers no sub-views; the empty list must survive
+        // the round trip as an empty list, not as garbage.
+        .{ .configure_share = .{ .kind = .window, .id = 4, .items = &.{} } },
+        .{ .share_started = .{ .node_id = 4242, .kind = .screen, .id = 5 } },
+        .{ .share_started = .{ .node_id = 1, .kind = .window, .id = 6 } },
+        .{ .share_stopped = {} },
+    };
+    for (evs) |ev| {
+        const k = ev.kind();
+        const data = try ev.encodeAlloc(alloc, .raw);
+        defer alloc.free(data);
+        const dec = try compositor.Event.decodeAllocWith(alloc, k, data, .raw);
+        defer dec.deinit(alloc);
+        try t.expectEqual(k, dec.kind());
+        switch (ev) {
+            .configure_share => |v| {
+                try t.expectEqual(v.kind, dec.configure_share.kind);
+                try t.expectEqual(v.id, dec.configure_share.id);
+                try t.expectEqual(v.items.len, dec.configure_share.items.len);
+                for (v.items, dec.configure_share.items) |a, b| {
+                    try t.expectEqual(a.id, b.id);
+                    try t.expectEqualStrings(a.title, b.title);
+                }
+            },
+            .share_started => |v| {
+                try t.expectEqual(v.node_id, dec.share_started.node_id);
+                try t.expectEqual(v.kind, dec.share_started.kind);
+                try t.expectEqual(v.id, dec.share_started.id);
+            },
+            else => {},
+        }
+    }
+
+    // A decode of a share message that arrives with trailing junk must be
+    // rejected rather than silently accepted: these messages start a stream.
+    {
+        // share_stop has an empty body, so any trailing byte is junk.
+        const k = @intFromEnum(compositor.RequestTag.share_stop);
+        const junk = [_]u8{0xFF};
+        try t.expectError(error.InvalidData, compositor.Request.decodeAllocWith(alloc, k, &junk, .raw));
+
+        // configure_share carries a kind byte; an unknown one must be
+        // refused rather than coerced into a stream of the wrong view.
+        const k2 = @intFromEnum(compositor.EventTag.configure_share);
+        const bad_kind = [_]u8{ 0x7F, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
+        try t.expectError(error.InvalidData, compositor.Event.decodeAllocWith(alloc, k2, &bad_kind, .raw));
+    }
 }

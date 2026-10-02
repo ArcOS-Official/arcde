@@ -227,12 +227,61 @@ fn buildCompositor(b: *std.Build, opts: CompositorOptions) !void {
             .flags = &.{ "-std=c99", "-O2" },
         });
 
+        // Screen share: the compositor owns the PipeWire stream end to end,
+        // so the producer lives here rather than in the shell. See
+        // compositor/src/ShareStream.zig.
+        //
+        // linkSystemLibrary resolves via pkg-config by default
+        // (use_pkg_config = .yes), which is what supplies PipeWire's and
+        // SPA's include dirs -- there is no linkPkgConfig in this Zig.
+        nile.root_module.linkSystemLibrary("libpipewire-0.3", .{});
+        nile.root_module.linkSystemLibrary("libspa-0.2", .{});
+        nile.root_module.addCSourceFile(.{
+            .file = b.path(src_dir ++ "src/pipewire_share.c"),
+            .flags = &.{ "-std=gnu11", "-O2" },
+        });
+
         b.installArtifact(nile);
         opts.check_step.dependOn(&nile.step);
 
         const runner = b.addRunArtifact(nile);
         const run = b.step("run-compositor", "Run the compositor");
         run.dependOn(&runner.step);
+    }
+
+    // Screen-share verifier: a standalone client that drives the compositor
+    // over the bank socket and checks the composed image, so the feature can
+    // be proven without PipeWire, a portal, or a session bus.
+    {
+        const verify_mod = b.createModule(.{
+            .root_source_file = b.path("tools/share_verify.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        verify_mod.addImport("bank", opts.bank_mod);
+        const share_verify = b.addExecutable(.{
+            .name = "nile-share-verify",
+            .root_module = verify_mod,
+            .use_llvm = opts.use_llvm,
+            .use_lld = opts.use_lld,
+        });
+        b.installArtifact(share_verify);
+    }
+
+    // Screen-share geometry tests. Deliberately a standalone file with no
+    // imports: this is the one part of the share pipeline that can be
+    // exercised without a compositor, a renderer or a GPU.
+    {
+        const share_geom_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_dir ++ "src/share_geom.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .use_llvm = opts.use_llvm,
+        });
+        opts.test_step.dependOn(&b.addRunArtifact(share_geom_test).step);
+        opts.check_step.dependOn(&share_geom_test.step);
     }
 
     // slotmap unit tests
@@ -454,6 +503,24 @@ fn buildShell(b: *std.Build, opts: ShellOptions) !void {
         .optimize = optimize,
     });
     tabler_shim.addImport("dvui", dvui_shim);
+    // Screen-share model + bank-request tests.
+    const share_test_module = b.createModule(.{
+        .root_source_file = b.path(src_dir ++ "/test_share.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    share_test_module.addImport("bank", opts.bank_mod);
+    share_test_module.addImport("dvui", dvui_shim);
+    share_test_module.addImport("tabler", tabler_shim);
+    share_test_module.addImport("sd_bus", sd_bus_mod);
+    const share_tests = b.addTest(.{
+        .root_module = share_test_module,
+        .use_llvm = opts.use_llvm,
+        .use_lld = opts.use_lld,
+    });
+    opts.test_step.dependOn(&b.addRunArtifact(share_tests).step);
+    opts.check_step.dependOn(&share_tests.step);
+
     const hub_test_module = b.createModule(.{
         .root_source_file = b.path(src_dir ++ "/test_hub_ui.zig"),
         .target = target,

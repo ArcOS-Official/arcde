@@ -230,6 +230,21 @@ popup_tree: *wlr.SceneTree,
 capture_scene: *wlr.Scene,
 capture_source: ?*wlr.ExtImageCaptureSourceV1 = null,
 
+/// True when the user asked for this window to be hidden from the active
+/// screen share.
+///
+/// Deliberately separate from `rendering_requested.hidden`, which is the
+/// wm's animation-scoped visibility (workspace switches, close fades) and is
+/// ANDed with `state == .mapped` at every use site. Reusing it could not
+/// express "invisible to the recipient, fully normal for the user": it
+/// would also disable the window's own tree, i.e. the user's screen.
+///
+/// This flag is read only by the share compositor (Share.zig) when it
+/// assembles the outgoing frame. It never touches `window.tree`, so the
+/// user keeps seeing, clicking and typing into the window normally.
+/// Main thread only.
+share_hidden: bool = false,
+
 /// State to be sent to the wm in the next manage sequence.
 wm_scheduled: struct {
     dimensions_hint: DimensionsHint = .{},

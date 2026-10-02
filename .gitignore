@@ -2,3 +2,5 @@
 zig-out/
 zig-pkg/
 .zig-cache-root-owned-bak/
+share-visible.ppm
+share-hidden.ppm

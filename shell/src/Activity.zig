@@ -11,7 +11,11 @@ const proto = nilebank.protocols.compositor;
 // cadence, the UI reads cheap snapshots, stops go through a small queue.
 
 pub const Kind = enum { record, share, mic, camera, download };
-pub const Source = enum { pipewire, downloads };
+/// Where an indicator came from. `share_session` is the share the
+/// compositor owns end to end: the compositor pushes its state over the
+/// bank socket, so it is authoritative and must not be inferred from
+/// PipeWire (nor stopped with `pw-cli destroy` -- see `Activity.requestStop`).
+pub const Source = enum { pipewire, downloads, share_session };
 
 pub const Item = struct {
     id: u64, // PipeWire node id, or a local counter id
@@ -80,6 +84,10 @@ next_id: u64 = 1,
 streams: std.ArrayList(StreamEntry) = .empty,
 downloads: std.ArrayList([]const u8) = .empty,
 stops: std.ArrayList(StopCmd) = .empty,
+/// PipeWire node id of the compositor-owned share, or 0 when none runs.
+/// Our producer is a `Video/Source` like any other, so without this the
+/// pw-dump sweep would report the same share twice as a generic `.share`.
+own_share_node: u32 = 0,
 
 next_pw_ms: i64 = 0,
 next_dl_ms: i64 = 0,
@@ -109,6 +117,17 @@ fn bump(self: *Activity) void {
     self.gen +%= 1;
 }
 
+/// Record (or clear) the compositor-owned share. Driven by the shell's
+/// applyEvent on `share_started` / `share_stopped`; 0 means none.
+pub fn setOwnShareNode(self: *Activity, node_id: u32) void {
+    if (!self.inited) return;
+    self.mu.lockUncancelable(self.io);
+    defer self.mu.unlock(self.io);
+    if (self.own_share_node == node_id) return;
+    self.own_share_node = node_id;
+    self.bump();
+}
+
 fn allocId(self: *Activity) u64 {
     const id = self.next_id;
     self.next_id +%= 1;
@@ -133,6 +152,7 @@ pub fn counts(self: *Activity) Counts {
         .camera => c.camera += 1,
         .download => {},
     };
+    if (self.own_share_node != 0) c.share += 1;
     c.download = self.downloads.items.len;
     return c;
 }
@@ -165,6 +185,23 @@ pub fn snapshotCopy(self: *Activity, alloc: std.mem.Allocator) Snapshot {
             if (label.len > 0) alloc.free(label);
             if (detail.len > 0) alloc.free(detail);
             continue;
+        };
+    }
+    if (self.own_share_node != 0) {
+        const label = alloc.dupe(u8, "Screen share") catch "";
+        errdefer if (label.len > 0) alloc.free(label);
+        const detail = std.fmt.allocPrint(alloc, "node {d}", .{self.own_share_node}) catch "";
+        errdefer if (detail.len > 0) alloc.free(detail);
+        list.append(alloc, .{
+            .id = self.own_share_node,
+            .kind = .share,
+            .source = .share_session,
+            .label = label,
+            .detail = detail,
+            .stop_id = self.own_share_node,
+        }) catch {
+            if (label.len > 0) alloc.free(label);
+            if (detail.len > 0) alloc.free(detail);
         };
     }
     for (self.downloads.items) |n| {
@@ -419,6 +456,10 @@ fn adoptPwDump(self: *Activity, text: []const u8) bool {
         if (!src.running) continue;
         // Monitor ports echo sink output; they are not microphones.
         if (std.mem.indexOf(u8, src.name, "monitor") != null) continue;
+        // The compositor-owned share is reported from bank events, with a
+        // Stop that actually stops it. Skip it here or the indicator strip
+        // would show two glyphs for one share.
+        if (self.own_share_node != 0 and src.id == self.own_share_node) continue;
         for (links.items) |lk| {
             if (lk[0] != src.id) continue;
             const consumer = self.findNode(nodes.items, lk[1]) orelse continue;

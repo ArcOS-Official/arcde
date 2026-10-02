@@ -1,0 +1,14 @@
+# arc.portal: xdg-desktop-portal backend descriptor for Arc Desktop.
+#
+# xdg-desktop-portal loads the descriptors in
+# $prefix/share/xdg-desktop-portal and picks a backend per interface by
+# matching UseIn against $XDG_CURRENT_DESKTOP (launch-arc exports "arc").
+# We advertise ScreenCast only, so everything else (Screenshot, OpenURI,
+# ...) keeps going to the portal that already handles it for our UseIn list.
+#
+# The D-Bus name must match the one shell/src/Portal.zig requests:
+# org.freedesktop.impl.portal.desktop.arc.
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.arc
+Interfaces=org.freedesktop.impl.portal.ScreenCast;
+UseIn=arc;

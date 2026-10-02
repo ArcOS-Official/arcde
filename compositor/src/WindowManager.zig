@@ -519,6 +519,24 @@ fn renderFinish(wm: *WindowManager) void {
     // Notify compositor that a frame tick completed — good place for deferred arrange
     @import("Compositor.zig").notify(.frame);
 
+    // Screen-share frame compositor. Driven off the same tick so the shared
+    // image tracks what the user sees. "Dirty" is taken from the outputs'
+    // own needsFrame rather than assumed every tick, so an idle desktop
+    // rebuilds nothing; ShareScene's own 33ms cap then bounds the rate
+    // regardless of display refresh.
+    {
+        const ShareScene = @import("ShareScene.zig");
+        var damaged = false;
+        var oit = server.om.outputs.iterator(.forward);
+        while (oit.next()) |out| {
+            if (out.scene_output) |so| {
+                if (so.needsFrame()) damaged = true;
+            }
+        }
+        if (damaged) ShareScene.markDirty();
+        ShareScene.tick(@intCast(@divTrunc(util.timestamp().sec * 1000 + @divTrunc(util.timestamp().nsec, std.time.ns_per_ms), 1)));
+    }
+
     if (wm.scheduled.dirty or wm.scheduled.dirty_lazy or wm.rendering_scheduled.dirty) {
         wm.addDirtyIdle();
     }

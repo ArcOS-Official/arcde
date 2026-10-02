@@ -920,6 +920,11 @@ const AsyncOp = union(enum) {
     release_keyboard_focus: void,
     refresh_shell_focus: void,
     exit_session: void,
+    share_configured: struct { kind: protocols.ShareKind, id: u64, hidden: []u64 },
+    share_stop: void,
+    set_share_hidden: struct { id: u64, hidden: bool },
+    share_select: struct { kind: protocols.ShareKind, id: u64 },
+    share_snapshot: u64, // serial, echoed back in share_frame
 };
 
 const DummyMutex = struct {
@@ -1262,6 +1267,25 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                 log.info("bank: exit_session requested -> terminating Wayland session", .{});
                 @import("Nile.zig").exitSession();
             },
+            .share_select => |v| {
+                // Answers the picker's tile click with `configure_share`,
+                // carrying the windows the user may hide on this view.
+                @import("Share.zig").beginConfigure(v.kind, v.id, bank_alloc);
+            },
+            .share_configured => |v| {
+                @import("Share.zig").applyConfigured(v.kind, v.id, v.hidden);
+                // Copied by bankCallback for this queue; release it here.
+                if (v.hidden.len > 0) bank_alloc.free(v.hidden);
+            },
+            .share_stop => {
+                @import("Share.zig").stop();
+            },
+            .set_share_hidden => |v| {
+                @import("Share.zig").setWindowHidden(v.id, v.hidden);
+            },
+            .share_snapshot => |serial| {
+                @import("Share.zig").snapshot(serial, bank_alloc);
+            },
         }
     }
     return 0;
@@ -1277,6 +1301,8 @@ fn queueAsync(op: AsyncOp) void {
             bank_alloc.free(op.set_workspace_name.name);
         } else if (op == .request_keyboard_focus and op.request_keyboard_focus.namespace.len > 0) {
             bank_alloc.free(op.request_keyboard_focus.namespace);
+        } else if (op == .share_configured and op.share_configured.hidden.len > 0) {
+            bank_alloc.free(op.share_configured.hidden);
         }
         return;
     };
@@ -1456,6 +1482,35 @@ fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message
         .set_window_fullscreen => |v| blk: {
             queueAsync(.{ .set_window_fullscreen = .{ .id = v.id, .fullscreen = v.fullscreen } });
             break :blk .{ .pong = .{ .nonce = v.id } };
+        },
+        .share_configured => |v| blk: {
+            // `hidden` is heap-owned by the decoded request; copy it for the
+            // main-thread queue. queueAsync takes ownership of the slice
+            // either way — it frees it itself if the append fails.
+            const n = v.hidden.len;
+            var empty: [0]u64 = .{};
+            const copy: []u64 = if (n > 0) try alloc.dupe(u64, v.hidden) else empty[0..];
+            queueAsync(.{ .share_configured = .{ .kind = v.kind, .id = v.id, .hidden = copy } });
+            break :blk .{ .pong = .{ .nonce = v.id } };
+        },
+        .share_stop => blk: {
+            queueAsync(.share_stop);
+            break :blk .{ .pong = .{ .nonce = 0 } };
+        },
+        .set_share_hidden => |v| blk: {
+            queueAsync(.{ .set_share_hidden = .{ .id = v.id, .hidden = v.hidden } });
+            break :blk .{ .pong = .{ .nonce = v.id } };
+        },
+        .share_select => |v| blk: {
+            queueAsync(.{ .share_select = .{ .kind = v.kind, .id = v.id } });
+            break :blk .{ .pong = .{ .nonce = v.id } };
+        },
+        .share_snapshot => |v| blk: {
+            // Rendered on the main thread (the renderer and scene graph are
+            // not thread-safe), so it cannot answer inline; the frame comes
+            // back as a `share_frame` broadcast carrying this serial.
+            queueAsync(.{ .share_snapshot = v.serial });
+            break :blk .{ .pong = .{ .nonce = v.serial } };
         },
         .set_workspace_mode => |v| blk: {
             queueAsync(.{ .set_workspace_mode = .{ .id = v.id, .mode = v.mode } });

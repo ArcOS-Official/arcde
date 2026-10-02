@@ -105,6 +105,15 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
         } else if (std.mem.eql(u8, t, "switchMode")) {
             const mode = parseMode(obj.get("mode").?.string) orelse return error.BadMode;
             h.switchMode(mode, &state);
+        } else if (std.mem.eql(u8, t, "share_request")) {
+            // Portal ScreenCast Start -> picker. Models the pending edge
+            // exactly like hubFrame consumes it: set on another thread,
+            // drained in hub context so the resize animation is registered
+            // on the hub window.
+            state.share_open_pending.store(true, .seq_cst);
+            if (state.share_open_pending.swap(false, .seq_cst)) {
+                h.switchMode(.sharescreen, &state);
+            }
         } else if (std.mem.eql(u8, t, "toggleNetwork")) {
             h.toggleNetworkMenu(&state);
         } else if (std.mem.eql(u8, t, "render")) {
@@ -145,6 +154,11 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
 
             const consumed = switch (h.hubmode) {
                 .windows => h.handleWindowsKey(code, act, &state) or h.handleGlobalKey(code, act, shift, now, &state),
+                // Share picker reuses the windows key handler (Escape
+                // dismisses to clock), so it must dispatch the same way or
+                // the escape case would silently fall through to the global
+                // handler and do nothing.
+                .sharescreen => h.handleWindowsKey(code, act, &state) or h.handleGlobalKey(code, act, shift, now, &state),
                 .launcher => h.handleLauncherKey(code, act, &state) or h.handleGlobalKey(code, act, shift, now, &state),
                 .network => h.handleNetworkKey(code, act, &state) or h.handleGlobalKey(code, act, shift, now, &state),
                 else => h.handleGlobalKey(code, act, shift, now, &state),

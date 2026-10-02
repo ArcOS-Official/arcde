@@ -81,6 +81,11 @@ suppress_clock_push: bool = false,
 // (clock -> network snapped instead of animating).
 net_toggle_pending: bool = false,
 
+// Share picker: the view whose tile was clicked, waiting on the
+// compositor's `configure_share` reply. Null until a tile is clicked.
+// Carries its kind because Output and Window ids share no namespace.
+share_pick: ?State.ShareView = null,
+
 // Controls <-> network transition, start ms (null = idle). Set by
 // openNetworkFaded / closeNetworkFaded at click time; the hub renders the
 // outgoing mode for the first half of the fade (fading out) and hubFrame
@@ -126,6 +131,11 @@ pub const HubMode = enum {
     windows,
     launcher,
     search,
+    sharescreen,
+    /// Share configuration: opened by the compositor's `configure_share`
+    /// after the user picks a view. Ticks the windows to black-box, then
+    /// confirms.
+    shareconfigure,
     controls,
 };
 
@@ -185,6 +195,12 @@ pub fn targetForMedia(mode: HubMode, has_media: bool) dvui.Size {
 pub fn targetForFull(mode: HubMode, has_media: bool, n_indicators: usize) dvui.Size {
     var s = switch (mode) {
         .windows => dvui.Size{ .w = 600, .h = 120 },
+        // Share picker. Taller than the windows switcher: it lists displays
+        // *and* windows, and the same tile grid is reused by the config menu
+        // for a screen share's sub-views.
+        .sharescreen => dvui.Size{ .w = 480, .h = 300 },
+        // Same tile grid as the picker, so the two feel like one flow.
+        .shareconfigure => dvui.Size{ .w = 480, .h = 300 },
         .launcher => dvui.Size{ .w = 520, .h = 360 },
         .network => dvui.Size{ .w = 520, .h = 420 },
         .clock => if (has_media) dvui.Size{ .w = 444, .h = 50 } else dvui.Size{ .w = 150, .h = 50 },
@@ -261,6 +277,10 @@ pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
         // Mid-fade commit is exempt (controls_fade_start still set).
         self.menu_origin = null;
     }
+    if (mode == .shareconfigure) {
+        // Sub-view tiles show the same thumbnails as the picker.
+        if (self.hubmode != .shareconfigure) state.prefetchWindowImages();
+    }
     if (self.hubmode == .controls and (mode == .network or mode == .launcher or mode == .windows)) {
         // Any sub-panel opened FROM the control center starts a
         // controls session (network stamps it in openNetworkFaded too;
@@ -326,6 +346,14 @@ pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
         if (self.hubmode != .launcher) {
             self.launcher_need_focus = true;
             self.last_hubmode = self.hubmode;
+        }
+    }
+    if (mode == .sharescreen) {
+        if (self.hubmode != .sharescreen) {
+            self.share_pick = null;
+            // One round trip for every tile's thumbnail instead of one per
+            // frame as the picker scrolls into view.
+            state.prefetchViewImages();
         }
     }
     if (mode == .network) {
@@ -423,6 +451,18 @@ pub fn selectIndex(self: *HubUi, state: *State, idx: usize) void {
         return;
     }
     self.selected = idx % state.windows.len;
+}
+
+// Share picker counterpart of selectIndex(). Bounded against share_views,
+// which is a different list from `windows`: it also holds displays and
+// skips outputs with no active mode, so its length never tracks the
+// window count.
+pub fn selectIndexShare(self: *HubUi, state: *State, idx: usize) void {
+    if (state.share_views.len == 0) {
+        self.selected = 0;
+        return;
+    }
+    self.selected = idx % state.share_views.len;
 }
 
 pub fn selectNext(self: *HubUi, state: *State) void {
@@ -718,6 +758,22 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
     if (state.launcher_close_pending) {
         state.launcher_close_pending = false;
         if (self.hubmode != .clock) self.dismissHome(state);
+    }
+
+    // Portal ScreenCast Start (see State.beginShareRequest): a client asked
+    // to share, so open the picker. Same pattern as the MOD+/ launcher edge
+    // above — consumed here so switchMode and its resize animation run in
+    // hub context, not on the portal thread.
+    if (state.share_open_pending.swap(false, .seq_cst)) {
+        self.switchMode(.sharescreen, state);
+    }
+
+    // The compositor accepted a picked view and is telling us which windows
+    // it could hide on it. Open the config menu. Until the user confirms
+    // nothing is shared, so dismissing here shares nothing.
+    if (state.share_configure_pending) {
+        state.share_configure_pending = false;
+        self.switchMode(.shareconfigure, state);
     }
 
     // Compositor logout confirm (first MOD+Shift+q): show the control
@@ -2207,6 +2263,232 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
         // Legacy .search mode is never entered (the launcher opens only
         // via MOD+/): fail safe to clock, never to the launcher.
         .search => self.switchMode(.clock, state),
+        .sharescreen => {
+            const list = dvui.flexbox(
+                @src(),
+                .{ .justify_content = .center },
+                .{
+                    .background = false,
+                    .expand = .both,
+                },
+            );
+            defer list.deinit();
+
+            for (dvui.events()) |ev| {
+                if (ev.evt != .key) continue;
+                const k = ev.evt.key;
+                const action: KeyAction = switch (k.action) {
+                    .down => .down,
+                    .up => .up,
+                    else => .repeat,
+                };
+                if (self.handleWindowsKey(k.code, action, state)) break;
+            }
+            if (self.selected >= state.windows.len) self.selectIndex(state, self.selected);
+
+            var focused_idx: ?usize = null;
+            var hovered_idx: ?usize = null;
+            // TODO: Implement shareviews, shareviews are a part of the `State` struct
+            // that represent the shareable views with some client, like for example
+            // a window or a screen then after sending that I've selected a view
+            // the comopositor responds with a configure_share event after which
+            // I open a new menu (aka share_configure is on), from which the user configures
+            // some settings for the share and start confirms. Confirmation is delivered through
+            // a share_configured request containing all data then the compositor starts sharing
+            // the view with it's configured settings. The compositor should then notify that
+            // there is a share going on so that the indicator shows up, then you can stop
+            // the sharing through the shell to the compositor through the activity menu.
+            // The config menu should be something very simillar to this picker but instead of
+            // selecting and closing on click it just selects it and lets you select other ones
+            // then it closes and reports all the selected subviews
+            // (only appear when the view is a screen, for now just skip if the
+            // selected view is a window). The compositor should hide the hidden
+            // window by rendering it as a black box instead of it's actual texture.
+            // NOTE: remove this todo when done.
+            for (state.share_views, 0..) |s, i| {
+                const c = if (i == self.selected)
+                    base.lighten(10.0)
+                else if (s.default)
+                    t.color(.highlight, .fill).lighten(-15.0)
+                else
+                    base;
+                var btn: dvui.ButtonWidget = undefined;
+                btn.init(@src(), .{}, .{
+                    .color_fill = c,
+                    .expand = .ratio,
+                    .max_size_content = .{ .w = 100, .h = 100 },
+                    .min_size_content = .{ .w = 60, .h = 60 },
+                    .id_extra = i,
+                });
+                btn.processEvents();
+                btn.drawBackground();
+                defer btn.deinit();
+                if (btn.focused()) {
+                    focused_idx = i;
+                }
+                if (btn.hovered()) {
+                    hovered_idx = i;
+                }
+                if (self.windows_need_focus and i == self.selected) {
+                    dvui.focusWidget(btn.data().id, null, null);
+                    focused_idx = i;
+                }
+                if (btn.clicked()) {
+                    // A share pick is not a focus change. The stub called
+                    // focusWindow(s.id) unconditionally, which is wrong on
+                    // two counts: a screen tile's id is an Output id, not a
+                    // Window id, and picking a share source must leave the
+                    // user's focus alone.
+                    //
+                    // Hand the choice to the portal thread and close the
+                    // picker; the compositor answers with `configure_share`,
+                    // which is what opens the config menu (see hubFrame).
+                    state.selectShareOutput(s.kind, s.id, s.title);
+                    self.share_pick = s;
+                    self.selectIndexShare(state, i);
+                    self.switchMode(.clock, state);
+                }
+                var box = dvui.box(
+                    @src(),
+                    .{ .dir = .vertical, .equal_space = true },
+                    .{
+                        .background = false,
+                        .expand = .both,
+                    },
+                );
+                defer box.deinit();
+                if (state.viewImage(s)) |src| {
+                    _ = dvui.image(@src(), .{
+                        .shrink = .ratio,
+                        .source = src,
+                    }, .{
+                        .expand = .both,
+                        .padding = .{ .y = 10 },
+                        .gravity_x = 0.5,
+                    });
+                } else {
+                    // Aliased placeholder: 1-bit raster shown 1:1.
+                    if (Icons.iconPx(.photo, 64, .white) catch null) |crisp| {
+                        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                            .expand = .both,
+                            .padding = .{ .y = 10 },
+                            .gravity_x = 0.5,
+                        });
+                    }
+                }
+                dvui.labelNoFmt(@src(), s.title, .{
+                    .align_x = 0.5,
+                    .align_y = 0.5,
+                }, .{
+                    .font = t.font_title,
+                    .expand = .horizontal,
+                });
+            }
+            self.windows_need_focus = false;
+            if (focused_idx) |f| {
+                self.selectIndexShare(state, f);
+            } else if (hovered_idx) |h| {
+                self.selectIndexShare(state, h);
+            }
+        },
+        .shareconfigure => {
+            // The compositor can retract the view (unplugged, closed)
+            // between the pick and now; then there is nothing to configure.
+            if (state.share_configure) |cfg| {
+            for (dvui.events()) |ev| {
+                if (ev.evt != .key) continue;
+                const k = ev.evt.key;
+                const action: KeyAction = switch (k.action) {
+                    .down => .down,
+                    .up => .up,
+                    else => .repeat,
+                };
+                if (k.code == .escape and action == .down) {
+                    self.dismissHome(state);
+                }
+            }
+
+            var list = dvui.box(@src(), .{ .dir = .vertical }, .{
+                .expand = .both,
+                .background = false,
+                .padding = .all(6),
+            });
+            defer list.deinit();
+
+            // Sub-views exist only for a screen: a shared window has
+            // nothing inside it to hide.
+            if (cfg.kind == .screen and cfg.items.len > 0) {
+                dvui.labelNoFmt(@src(), "Hide windows from the share", .{}, .{
+                    .color_text = t.color(.content, .text).opacity(60),
+                    .expand = .horizontal,
+                    .margin = .{ .y = 4 },
+                });
+                for (cfg.items) |it| {
+                    const hidden = state.isShareHidden(it.id);
+                    var row: dvui.ButtonWidget = undefined;
+                    row.init(@src(), .{}, .{
+                        .expand = .horizontal,
+                        .background = true,
+                        .color_fill = if (hidden)
+                            t.color(.highlight, .fill).lighten(-15.0)
+                        else
+                            base,
+                        .border = .all(1),
+                        .color_border = t.color(.content, .text).opacity(0.08),
+                        .corners = .all(6),
+                        .padding = .all(6),
+                        .margin = .{ .y = 2 },
+                        .id_extra = @intCast(it.id),
+                    });
+                    row.processEvents();
+                    row.drawBackground();
+                    defer row.deinit();
+                    if (row.clicked()) state.setShareHidden(it.id, !hidden);
+                    dvui.labelNoFmt(@src(), it.title, .{}, .{
+                        .font = t.font_title,
+                        .color_text = t.color(.content, .text),
+                        .expand = .horizontal,
+                    });
+                }
+            } else {
+                dvui.labelNoFmt(@src(), "Nothing to hide here.", .{
+                    .align_x = 0.5,
+                    .align_y = 0.5,
+                }, .{
+                    .color_text = t.color(.content, .text).opacity(0.6),
+                    .expand = .horizontal,
+                });
+            }
+
+            var start: dvui.ButtonWidget = undefined;
+            start.init(@src(), .{}, .{
+                .expand = .horizontal,
+                .background = true,
+                .color_fill = t.color(.highlight, .fill),
+                .color_fill_hover = t.color(.highlight, .fill).lighten(10),
+                .border = .all(1),
+                .color_border = t.color(.content, .text).opacity(0.08),
+                .corners = .all(6),
+                .padding = .all(8),
+                .margin = .{ .y = 8 },
+            });
+            start.processEvents();
+            start.drawBackground();
+            defer start.deinit();
+            dvui.labelNoFmt(@src(), "Start sharing", .{}, .{
+                .font = t.font_title,
+                .expand = .horizontal,
+            });
+            if (start.clicked()) {
+                // Confirm and hand back to the portal thread, which is
+                // still blocked in ScreenCast Start.
+                state.confirmShare(cfg.kind, cfg.id);
+                self.switchMode(.clock, state);
+            }
+            } else {
+                self.dismissHome(state);
+            }
+        },
     }
 
     return .ok;
@@ -2506,6 +2788,14 @@ fn activitySection(self: *HubUi, state: *State, t: *dvui.Theme) void {
             .pipewire => {
                 if (dvui.button(@src(), "Stop", .{}, .{ .id_extra = i, .gravity_y = 0.5 })) {
                     state.activity.requestStop(.pipewire, it.stop_id);
+                }
+            },
+            .share_session => {
+                // The compositor owns this stream, so `pw-cli destroy` on the
+                // node would leave the compositor thinking it is still live.
+                // Go through the protocol instead.
+                if (dvui.button(@src(), "Stop", .{}, .{ .id_extra = i, .gravity_y = 0.5 })) {
+                    state.stopShare();
                 }
             },
             .downloads => {

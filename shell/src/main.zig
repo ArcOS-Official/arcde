@@ -2,6 +2,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const ls = @import("layershell");
 const State = @import("State.zig");
+const Portal = @import("Portal.zig");
 const HubUi = @import("HubUi.zig");
 const Icons = @import("Icons.zig");
 const Wallpaper = @import("Wallpaper.zig");
@@ -235,6 +236,23 @@ pub fn main(init: std.process.Init) !u8 {
     // frees the model: LIFO defers run cancel first.
     var a = io.async(State.worker, .{ &state, io });
     defer a.cancel(io);
+
+    // Portal ScreenCast backend. Its own thread because the impl interface
+    // answers Start synchronously: the call blocks while the picker is up,
+    // and sd_bus_process cannot be pumped from inside a message handler.
+    // Keeping it off State.worker means a picker sitting open for 25s never
+    // stalls compositor pushes or notification delivery.
+    //
+    // The compositor owns the actual stream (compositor/src/ShareStream.zig),
+    // so once configured this thread does nothing but wait on the bus.
+    var portal: Portal = undefined;
+    portal.init(gpa, io, &state);
+    var p = io.async(struct {
+        pub fn run(portal_: *Portal, state_: *State) void {
+            portal_.threadMain(state_);
+        }
+    }.run, .{ &portal, &state });
+    defer p.cancel(io);
 
     var ref = io.async(struct {
         pub fn refresh(io_: std.Io) void {

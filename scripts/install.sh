@@ -194,12 +194,16 @@ fi
 # shellcheck disable=SC2086
 "$ZIG" build $zig_build_args --prefix "$prefix" "$@"
 
-mkdir -p "$bindir" "$sessiondir"
+mkdir -p "$bindir" "$sessiondir" "$datadir/xdg-desktop-portal"
 install -m 0755 "$root/scripts/launch-arc" "$bindir/launch-arc"
 install -m 0644 "$root/scripts/arc.desktop" "$sessiondir/arc.desktop"
+# Backend descriptor for the ScreenCast portal. Without it xdg-desktop-portal
+# has no reason to route org.freedesktop.impl.portal.ScreenCast to us.
+install -m 0644 "$root/scripts/arc.portal" "$datadir/xdg-desktop-portal/arc.portal"
 
 echo "install.sh: installed Arc Desktop to $prefix"
 echo "  binaries:  $bindir/nile $bindir/nshell"
 echo "  launcher:  $bindir/launch-arc"
 echo "  session:   $sessiondir/arc.desktop"
+echo "  portal:    $datadir/xdg-desktop-portal/arc.portal"
 echo "Pick \"Arc Desktop\" in your display manager to start the session."

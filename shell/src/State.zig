@@ -74,6 +74,20 @@ pub const Action = union(enum) {
     // Ask the compositor to terminate the Wayland session (log out).
     // Used by the power-menu Log Out confirm and any direct logout path.
     exit_session: void,
+    // --- screen share ---
+    share_select: ShareSelect,
+    share_configured: ShareConfigured,
+    share_stop: void,
+    set_share_hidden: SetShareHidden,
+    pub const ShareSelect = struct { kind: proto.ShareKind, id: u64 };
+    /// `hidden` is heap-owned by the caller and released once the request
+    /// has been encoded.
+    pub const ShareConfigured = struct {
+        kind: proto.ShareKind,
+        id: u64,
+        hidden: []u64,
+    };
+    pub const SetShareHidden = struct { id: u64, hidden: bool };
     pub const ShellFocusTarget = enum { hub, bar };
     pub const CaptureWindow = struct {
         id: u64,
@@ -88,11 +102,18 @@ pub const Action = union(enum) {
     pub const SetWorkspaceMode = struct { id: u64, mode: proto.WorkspaceMode };
     pub const SetFocusConfig = struct { switch_workspace_on_focus: bool };
 
-    fn deinit(self: *Action, alloc: std.mem.Allocator) void {
-        // No heap today (all payloads are plain data); kept for symmetry
-        // with proto.Request so drops stay leak-free if that changes.
-        _ = self;
-        _ = alloc;
+    pub fn deinit(self: *Action, alloc: std.mem.Allocator) void {
+        // Only share_configured owns heap: it carries the confirmed hidden
+        // set, which is handed over by confirmShare and released either by
+        // the send path (via proto.Request.deinit) or here, when the queue
+        // drops an item it never delivered.
+        switch (self.*) {
+            .share_configured => |*v| {
+                if (v.hidden.len > 0) alloc.free(v.hidden);
+                v.hidden = &.{};
+            },
+            else => {},
+        }
     }
 };
 
@@ -150,6 +171,71 @@ const ImageEntry = struct {
 
 const ImageMap = std.AutoHashMap(u64, ImageEntry);
 
+/// What a shareable view refers to. Screens and windows live in separate
+/// compositor id spaces (`Output.id` is a pointer, `Window.id` packs
+/// generation+index), so a view always carries its kind: a bare u64 cannot
+/// be resolved to the right image cache or the right bank request.
+///
+/// An alias of the wire type rather than a second enum: the picker, the
+/// config menu and the bank messages all pass this around, and two parallel
+/// enums would not convert implicitly.
+pub const ShareViewKind = proto.ShareKind;
+
+/// One tile in the share picker (HubUi `.sharescreen`). Derived from the
+/// live `windows`/`outputs` model rather than pushed by the compositor:
+/// everything a client could be handed is already enumerable there.
+/// `default` marks the view the compositor would pick if the user confirmed
+/// without touching anything.
+pub const ShareView = struct {
+    kind: ShareViewKind = .screen,
+    id: u64 = 0,
+    title: []const u8 = "",
+    default: bool = false,
+};
+
+/// Invalidation stamp for the derived `share_views` slice. The compositor
+/// replaces `windows`/`outputs` wholesale on every broadcast and never
+/// mutates them in place, so slice identity plus length is a sound
+/// generation proxy.
+const ShareViewsKey = struct {
+    windows_ptr: usize = 0,
+    windows_len: usize = 0,
+    outputs_ptr: usize = 0,
+    outputs_len: usize = 0,
+};
+pub const ConfigureShare = struct {
+    kind: proto.ShareKind = .screen,
+    id: u64 = 0,
+    items: []proto.ShareItem = &.{},
+};
+
+pub const ShareStarted = struct {
+    node_id: u32 = 0,
+    kind: proto.ShareKind = .screen,
+    id: u64 = 0,
+};
+
+pub const SharePickerState = enum(u8) {
+    /// No request in flight.
+    idle,
+    /// Picker is up, waiting for the user.
+    waiting,
+    /// The user picked a view; see shareSelection().
+    picked,
+    /// The user walked away, or the view disappeared.
+    cancelled,
+};
+
+/// Outcome of the picker, as the portal needs it: an id plus the display
+/// name it resolves on the compositor side.
+pub const ShareSelection = struct {
+    kind: proto.ShareKind = .screen,
+    id: u64 = 0,
+    name: []const u8 = "",
+};
+
+
+
 alloc: std.mem.Allocator = undefined,
 io: std.Io = undefined,
 
@@ -169,6 +255,25 @@ launcher_close_pending: bool = false,
 // "Are you sure you want to log out?" with Log Out / Cancel.
 // Set on the UI thread via applyEvent, consumed by HubUi.hubFrame.
 logout_prompt_pending: bool = false,
+// A portal client called ScreenCast Start: open the share picker. Set by
+// the portal thread via beginShareRequest, carried across to the UI thread
+// through the commit queue, consumed by HubUi.hubFrame (the mode switch
+// and its resize animation must run in hub context).
+share_open_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+// Portal ScreenCast handshake. `Portal.zig` runs on its own thread and
+// blocks in the impl interface's synchronous Start while the picker is up,
+// so it polls these instead of pushing anything.
+//
+// `portal_done` is the reverse edge: the portal thread sets it once it has
+// released everything it owns, which is what makes it safe for
+// State.deinit to free the model out from under it.
+share_picker: std.atomic.Value(SharePickerState) = std.atomic.Value(SharePickerState).init(.idle),
+/// Written by the UI thread when the user picks, read by the portal thread.
+/// Borrowed storage owned by the model: the portal only reads `id` and
+/// copies `name` before answering.
+share_selection: ShareSelection = .{},
+portal_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 // UI-thread thumbnail cache (see ImageEntry).
 images: ImageMap = undefined,
@@ -176,6 +281,35 @@ images: ImageMap = undefined,
 // canvases served by the compositor for capture_output. Same
 // fetch-on-call contract as windowImage().
 output_images: ImageMap = undefined,
+
+// UI-thread share picker model (see ShareView), derived from `windows` +
+// `outputs`. Rebuilt by rebuildShareViews() when either backing slice is
+// replaced wholesale by a broadcast; `share_views_key` is the
+// invalidation stamp (slice identity + length). Owned: rebuilt frees the
+// previous titles.
+share_views: []ShareView = &.{},
+share_views_key: ShareViewsKey = .{},
+
+/// A view the user picked, plus the sub-views the compositor says may be
+/// hidden on it. Owned (see freeShareConfigure); consumed by HubUi to build
+/// the config menu. Null when no config menu is open.
+share_configure: ?ConfigureShare = null,
+/// Set with `share_configure` so HubUi.hubFrame can open the config menu
+/// in hub context (the switch runs a resize animation, which must not
+/// start on the worker thread that decoded the event).
+share_configure_pending: bool = false,
+/// The share that is live right now, if any. Drives the activity indicator
+/// and the Stop button. Null when nothing is being shared.
+share_live: ?ShareStarted = null,
+/// The same fact as `share_live`, in a form the portal thread can poll.
+/// applyEvent runs on the UI thread while the portal is blocked in
+/// ScreenCast Start, so the two must not share a plain field.
+share_node_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+share_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+/// Window ids the user ticked in the config menu, plus any live
+/// set_share_hidden toggles. Sent as `share_configured.hidden` and kept so
+/// the config menu can render its own checkboxes.
+share_hidden_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
 /// UI -> worker outbox. Pushed by the UI thread, drained by worker().
 req_q: Queue(Action) = .{},
@@ -306,9 +440,20 @@ pub fn deinit(self: *State) void {
         if (self.nowMs() - t0 > 3000) break;
         std.Thread.yield() catch {};
     }
+    // The portal thread owns a pointer to this model and polls it while a
+    // ScreenCast Start is blocked on the picker. It sets portal_done once it
+    // has released everything it owns, so wait for that before freeing
+    // anything it could still be reading.
+    while (!self.portal_done.load(.seq_cst)) {
+        if (self.nowMs() - t0 > 5000) break;
+        std.Thread.yield() catch {};
+    }
     self.wakeup_fn = null;
     self.wakeup_ctx = null;
     self.freeModel();
+    self.freeShareViews();
+    self.freeShareConfigure();
+    self.share_hidden_ids.deinit(self.alloc);
     var it = self.images.iterator();
     while (it.next()) |kv| kv.value_ptr.deinit(self.alloc);
     self.images.deinit();
@@ -586,6 +731,216 @@ pub fn prefetchOutputImages(self: *State) void {
     }
 }
 
+// UI thread only. Thumbnail for a shareable view, dispatched on its kind so
+// a screen tile can never read the window cache (and vice versa): the two
+// id spaces overlap numerically (`Output.id` is a pointer, `Window.id`
+// packs generation+index). Cold cache returns null and enqueues the
+// matching capture; never blocks on IPC.
+pub fn viewImage(self: *State, v: ShareView) ?dvui.ImageSource {
+    return switch (v.kind) {
+        .screen => self.outputImage(v.id),
+        .window => self.windowImage(v.id),
+    };
+}
+
+// UI thread only. Prefetch every shareable view's thumbnail in one round
+// trip (screens via capture_output, windows via capture_window). Call when
+// opening the picker so tiles converge instead of arriving one per frame.
+pub fn prefetchViewImages(self: *State) void {
+    self.prefetchOutputImages();
+    self.prefetchWindowImages();
+}
+
+// UI thread only. Rebuild `share_views` from the live model whenever either
+// backing slice was replaced wholesale by a broadcast (slice identity +
+// length is the generation stamp — the compositor never mutates these in
+// place). Screens first so the first tile is a display: sharing a screen is
+// the overwhelmingly common case. Outputs with no active mode are skipped
+// rather than offered as a tile that can only ever show the placeholder.
+/// Force the derived picker model to refresh now. Normally driven from
+/// update(); pub so tests can exercise a rebuild without a socket.
+pub fn rebuildShareViewsNow(self: *State) void {
+    self.share_views_key = .{}; // defeat the generation check
+    self.rebuildShareViews();
+}
+
+fn rebuildShareViews(self: *State) void {
+    const key: ShareViewsKey = .{
+        .windows_ptr = @intFromPtr(self.windows.ptr),
+        .windows_len = self.windows.len,
+        .outputs_ptr = @intFromPtr(self.outputs.ptr),
+        .outputs_len = self.outputs.len,
+    };
+    if (std.meta.eql(key, self.share_views_key)) return;
+    self.share_views_key = key;
+
+    self.freeShareViews();
+
+    var list: std.ArrayList(ShareView) = .empty;
+    errdefer {
+        for (list.items) |v| self.alloc.free(v.title);
+        list.deinit(self.alloc);
+    }
+    for (self.outputs) |o| {
+        if (!o.enabled or o.mode.width == 0) continue;
+        const label = if (o.name.len > 0) o.name else o.model;
+        const title = self.alloc.dupe(u8, label) catch continue;
+        list.append(self.alloc, .{
+            .kind = .screen,
+            .id = o.id,
+            .title = title,
+            // First live display wins: the compositor's own default target.
+            .default = list.items.len == 0,
+        }) catch continue;
+    }
+    for (self.windows) |w| {
+        const title = self.alloc.dupe(u8, w.title) catch continue;
+        list.append(self.alloc, .{
+            .kind = .window,
+            .id = w.id,
+            .title = title,
+            .default = false,
+        }) catch continue;
+    }
+    self.share_views = list.toOwnedSlice(self.alloc) catch &.{};
+}
+
+fn freeShareViews(self: *State) void {
+    for (self.share_views) |v| {
+        if (v.title.len > 0) self.alloc.free(v.title);
+    }
+    if (self.share_views.len > 0) self.alloc.free(self.share_views);
+    self.share_views = &.{};
+}
+
+// Deep copy of a decoded ShareItem list. `alloc.dupe(proto.ShareItem, ..)`
+// would only copy the title *pointers*, leaving them aimed at memory the
+// event deinit is about to free.
+fn dupeShareItems(self: *State, src: []const proto.ShareItem) ?[]proto.ShareItem {
+    const out = self.alloc.alloc(proto.ShareItem, src.len) catch return null;
+    var n: usize = 0;
+    errdefer {
+        for (out[0..n]) |it| {
+            if (it.title.len > 0) self.alloc.free(it.title);
+        }
+        self.alloc.free(out);
+    }
+    while (n < src.len) : (n += 1) {
+        const title = self.alloc.dupe(u8, src[n].title) catch return null;
+        out[n] = .{ .id = src[n].id, .title = title };
+    }
+    return out;
+}
+
+fn freeShareConfigure(self: *State) void {
+    const cfg = self.share_configure orelse return;
+    for (cfg.items) |it| {
+        if (it.title.len > 0) self.alloc.free(it.title);
+    }
+    if (cfg.items.len > 0) self.alloc.free(cfg.items);
+    self.share_configure = null;
+}
+
+// --- share requests (UI thread; all non-blocking) -------------------------
+
+/// The user clicked a tile in the picker. The compositor answers with
+/// `configure_share` carrying the sub-views to offer.
+pub fn selectShareView(self: *State, kind: proto.ShareKind, id: u64) void {
+    self.share_hidden_ids.clearRetainingCapacity();
+    self.req_q.push(self.alloc, self.io, .{ .share_select = .{ .kind = kind, .id = id } });
+}
+
+/// Confirm the configured share. `hidden` replaces the compositor's whole
+/// hidden set, so this is the only place the set is sent.
+pub fn confirmShare(self: *State, kind: proto.ShareKind, id: u64) void {
+    var ids: std.ArrayList(u64) = .empty;
+    defer ids.deinit(self.alloc);
+    var it = self.share_hidden_ids.keyIterator();
+    while (it.next()) |k| ids.append(self.alloc, k.*) catch {};
+
+    // toOwnedSlice, not `ids.items`: an ArrayList's buffer is sized to its
+    // *capacity*, and alloc.free must be handed the original length or the
+    // allocator rejects it. toOwnedSlice shrinks the block to exactly len, so
+    // whoever frees it later (the send path, or Action.deinit) can.
+    var empty: [0]u64 = .{};
+    const owned: []u64 = ids.toOwnedSlice(self.alloc) catch empty[0..];
+
+    // req_q.push does not report failure, so the slice is handed over
+    // unconditionally; the send path's request deinit releases it.
+    self.req_q.push(self.alloc, self.io, .{
+        .share_configured = .{ .kind = kind, .id = id, .hidden = owned },
+    });
+    self.share_hidden_ids.clearRetainingCapacity();
+    self.freeShareConfigure();
+}
+
+/// Toggle one window's hide-for-share flag. Valid mid-share, which is what
+/// makes it usable from the activity menu after the config menu is gone.
+pub fn setShareHidden(self: *State, window_id: u64, hidden: bool) void {
+    if (hidden) {
+        self.share_hidden_ids.put(self.alloc, window_id, {}) catch {};
+    } else {
+        _ = self.share_hidden_ids.remove(window_id);
+    }
+    self.req_q.push(self.alloc, self.io, .{ .set_share_hidden = .{ .id = window_id, .hidden = hidden } });
+}
+
+/// True once the compositor has published a live stream, and its node id.
+/// Polled by the portal thread while Start blocks.
+pub fn shareNodeId(self: *const State) u32 {
+    return if (self.share_running.load(.seq_cst)) self.share_node_id.load(.seq_cst) else 0;
+}
+
+pub fn isShareHidden(self: *const State, window_id: u64) bool {
+    return self.share_hidden_ids.contains(window_id);
+}
+
+/// Stop the live share. Safe when nothing is shared: the compositor treats
+/// it as a no-op.
+pub fn stopShare(self: *State) void {
+    self.req_q.push(self.alloc, self.io, .{ .share_stop = {} });
+}
+
+// --- portal handshake (Portal.zig thread) ----------------------------------
+
+/// A client called ScreenCast Start. Opens the picker and marks the request
+/// in flight so `sharePickerState` reports `.waiting`.
+///
+/// Cross-thread: sets the atomic the portal thread polls and the
+/// `share_open_pending` flag the UI thread drains in hubFrame.
+pub fn beginShareRequest(self: *State) void {
+    self.share_selection = .{};
+    self.share_picker.store(.waiting, .seq_cst);
+    // Atomic, not a plain bool: this is written on the portal thread and
+    // drained on the UI thread.
+    self.share_open_pending.store(true, .seq_cst);
+    self.requestRefresh();
+}
+
+/// Current picker state. Polled by the portal thread while Start blocks.
+pub fn sharePickerState(self: *const State) SharePickerState {
+    return self.share_picker.load(.seq_cst);
+}
+
+/// The user's choice, valid only when the state is `.picked`.
+pub fn shareSelection(self: *const State) ShareSelection {
+    return self.share_selection;
+}
+
+/// Called by the picker when a tile is chosen.
+pub fn selectShareOutput(self: *State, kind: proto.ShareKind, id: u64, name: []const u8) void {
+    self.share_selection = .{ .kind = kind, .id = id, .name = name };
+    self.share_picker.store(.picked, .seq_cst);
+    self.requestRefresh();
+}
+
+/// Called by the picker on Escape or when the view disappears.
+pub fn cancelSharePicker(self: *State) void {
+    self.share_picker.store(.cancelled, .seq_cst);
+    self.share_open_pending.store(false, .seq_cst);
+    self.requestRefresh();
+}
+
 // UI thread only. Applies all queued broadcasts/captures to the model.
 // Broadcasts override current state: full-list pushes replace the slices,
 // incremental pushes merge. Runs between frames; never blocks on IPC.
@@ -597,6 +952,9 @@ pub fn update(self: *State) void {
         self.applyEvent(ev);
         ev.deinit(self.alloc);
     }
+    // Cheap identity check, so this is a no-op on frames where nothing
+    // about the window/output lists changed.
+    self.rebuildShareViews();
 }
 
 // Worker entry point. Owns the connection: (re)connects with backoff,
@@ -659,7 +1017,9 @@ pub fn worker(self: *State, io: std.Io) void {
         self.activity.takeStops(&stops);
         for (stops.items) |s| switch (s.source) {
             .pipewire => self.activity.destroyPipewireNode(s.stop_id),
-            .downloads => {},
+            // A compositor-owned share is stopped by the UI thread straight
+            // through `share_stop`, so it never enters this queue.
+            .share_session, .downloads => {},
         };
         const power_changed = self.power.tick() catch |e| blk: {
             std.log.err("Power error {s}", .{@errorName(e)});
@@ -985,6 +1345,28 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
             var ev = try conn.requestCompositor(.{ .exit_session = {} }, .raw);
             defer ev.deinit(self.alloc);
         },
+        .share_select => |v| {
+            var ev = try conn.requestCompositor(.{ .share_select = .{ .kind = v.kind, .id = v.id } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
+        .share_configured => |v| {
+            // The compositor decodes this into its own copy, so hand the
+            // slice over and let the request's deinit release it.
+            var ev = try conn.requestCompositor(.{ .share_configured = .{
+                .kind = v.kind,
+                .id = v.id,
+                .hidden = v.hidden,
+            } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
+        .share_stop => {
+            var ev = try conn.requestCompositor(.{ .share_stop = {} }, .raw);
+            defer ev.deinit(self.alloc);
+        },
+        .set_share_hidden => |v| {
+            var ev = try conn.requestCompositor(.{ .set_share_hidden = .{ .id = v.id, .hidden = v.hidden } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
     }
 }
 
@@ -1283,7 +1665,9 @@ fn adoptOutputImage(self: *State, id: u64, img: *proto.Image) void {
 // plus a get_window fill request so a missed new_window still converges
 // once the worker answers (fills arrive decomposed as incremental merges,
 // never as list replacements).
-fn applyEvent(self: *State, ev: *proto.Event) void {
+/// Pub so the headless tests can drive compositor pushes directly instead
+/// of standing up a socket connection.
+pub fn applyEvent(self: *State, ev: *proto.Event) void {
     switch (ev.*) {
         .windows_snapshot, .windows => {
             for (self.windows) |*w| w.deinit(self.alloc);
@@ -1414,6 +1798,40 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
         },
         .logout_prompt => {
             self.logout_prompt_pending = true;
+        },
+        .configure_share => |*v| {
+            // Own the payload before adopting: applyEvent takes ownership of
+            // the event and frees it, so the slice has to outlive that.
+            self.freeShareConfigure();
+            self.share_configure = if (self.dupeShareItems(v.items)) |items| .{
+                .kind = v.kind,
+                .id = v.id,
+                .items = items,
+            } else null;
+            self.share_configure_pending = self.share_configure != null;
+        },
+        .share_started => |v| {
+            self.share_live = .{
+                .node_id = v.node_id,
+                .kind = v.kind,
+                .id = v.id,
+            };
+            self.share_node_id.store(v.node_id, .seq_cst);
+            self.share_running.store(true, .seq_cst);
+            // Drives the activity indicator and its Stop button. Without
+            // this the share would only show up indirectly, on the next
+            // pw-dump sweep, with a Stop that destroys the node behind the
+            // compositor's back.
+            self.activity.setOwnShareNode(v.node_id);
+        },
+        .share_stopped => {
+            self.share_live = null;
+            self.share_node_id.store(0, .seq_cst);
+            self.share_running.store(false, .seq_cst);
+            self.activity.setOwnShareNode(0);
+            // A stopped share must not leave privacy flags behind: the user
+            // would see windows greyed out for a share that no longer runs.
+            self.share_hidden_ids.clearRetainingCapacity();
         },
         else => {},
     }

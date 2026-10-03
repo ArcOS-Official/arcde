@@ -264,6 +264,10 @@ pub const Node = union(enum) {
     /// drop_x/drop_y is the cursor position where the window was dropped (for tiling placement).
     /// orientation is the split direction for the new branch, or null for horizontal default.
     pub fn append(self: *Node, alloc: std.mem.Allocator, new: *Window, drop_x: i32, drop_y: i32) void {
+        // A window must never occupy two leaves: the second leaf splits the tree
+        // again but only one of the two boxes is ever drawn, so the other half of
+        // the screen stays permanently empty. `find` is pointer-identity only.
+        if (self.find(new) != null) return;
         switch (self.*) {
             .leaf => |l| {
                 const b1 = Box{
@@ -633,14 +637,22 @@ pub const NileCompositor = struct {
             win.rendering_requested.hidden = true;
             return;
         }
-        _ = self;
         Nile.Window.focus(win);
+        // `ensureCurrentTree` only ever tiles mapped windows, but `onWindowAdd`
+        // runs at `.ready` — one step earlier. Any arrange between the two drops
+        // this window again, so re-attach on map and apply geometry.
+        self.ensureCurrentTree();
+        self.layoutCurrent();
     }
 
     fn onWindowUnmap(self: *NileCompositor, win: *Window) void {
         // The focused window went away (minimize/close): fall back so
         // input never rests on a gone window.
         self.refocusAfterWindowGone(win);
+        // An unmapped window must not keep holding a tile: this is the release
+        // point for anything that unmaps without being destroyed.
+        self.ensureCurrentTree();
+        self.layoutCurrent();
     }
 
     fn onWindowDestroy(self: *NileCompositor, win: *Window) void {
@@ -1494,6 +1506,14 @@ pub const NileCompositor = struct {
             return;
         }
         const new_root = self.rootFor(new_id);
+        // Only mapped, non-floating windows take a tile on the destination —
+        // an unmapped window inserted here would split the tree and reserve
+        // empty space until the next arrange prunes it.
+        if (!isTileable(win, new_id)) {
+            if (new_root == self.cur()) self.layoutCurrent();
+            self.raiseFloatingWindows();
+            return;
+        }
         if (new_root.*) |*r| {
             const drop_x: i32 = @intCast(@max(0, win.box.x));
             const drop_y: i32 = @intCast(@max(0, win.box.y));
@@ -1512,6 +1532,22 @@ pub const NileCompositor = struct {
     pub fn arrange(self: *NileCompositor) void {
         self.ensureCurrentTree();
         self.layoutCurrent();
+    }
+
+    /// A window may hold a tile in the tiling tree of `ws` only when all three
+    /// hold: it is on `ws`, it is not floating (forced or via workspace mode),
+    /// and it is actually mapped.
+    ///
+    /// The `mapped` half is the important one. `Nile.Window.iter()` walks every
+    /// live `Window`, including ones still in `.init`/`.ready`/`.initialized`
+    /// (client has a toplevel but never mapped it) and ones in `.closing`.
+    /// Tiling any of those reserves a tile that no visible window ever paints,
+    /// which is what leaves a permanently empty slice of the workspace next to
+    /// the windows you can actually see.
+    fn isTileable(win: *Window, ws: u64) bool {
+        if (win.wm_requested.workspace != ws) return false;
+        if (win.isEffectivelyFloating()) return false;
+        return win.state == .mapped;
     }
 
     /// Attach any current-workspace windows missing from its tree (e.g. first
@@ -1537,49 +1573,52 @@ pub const NileCompositor = struct {
         const mode = server.workspace.getEffectiveMode(current_ws);
         if (mode == .floating) return;
         const root = self.cur();
+        if (root.* != null) {
+            // Prune windows that are in the tree but must no longer hold a tile
+            // (toggled floating, moved away, unmapped or closing). Without this a
+            // window that stops being tileable keeps its slice of the workspace
+            // forever. We cannot enumerate the tree, so iterate all windows and
+            // check membership instead.
+            var stale = std.ArrayList(*Window).empty;
+            defer stale.deinit(self.gpa);
+            const r: *Node = &root.*.?;
+            var it = Nile.Window.iter();
+            while (it.next()) |win| {
+                if (isTileable(win, current_ws)) continue;
+                if (r.find(win) != null) stale.append(self.gpa, win) catch unreachable;
+            }
+            for (stale.items) |win| {
+                if (r.find(win)) |n| {
+                    if (r.* == .leaf) {
+                        root.* = null;
+                        break;
+                    } else if (r.findParent(n)) |p| {
+                        // pop() collapses the branch onto the surviving
+                        // sibling, so a workspace that drops back to one window
+                        // ends up as a bare leaf filling the whole output
+                        // instead of a one-child branch holding half of it.
+                        p.pop(p.branch.first == n);
+                    }
+                }
+            }
+        }
         if (root.* == null) {
+            // No tree, or the prune above collapsed the last one away: build it
+            // from the windows that are actually tileable right now.
             var wins = std.ArrayList(*Window).empty;
             defer wins.deinit(self.gpa);
             var it = Nile.Window.iter();
             while (it.next()) |win| {
-                if (win.wm_requested.workspace != current_ws) continue;
-                if (win.isEffectivelyFloating()) continue;
+                if (!isTileable(win, current_ws)) continue;
                 wins.append(self.gpa, win) catch unreachable;
             }
             if (wins.items.len == 0) return;
             root.* = construct(self.gpa, wins.items);
             return;
         }
-        // Prune floating windows that are lingering in tree (e.g. toggled while in tree)
-        {
-            var wins = std.ArrayList(*Window).empty;
-            defer wins.deinit(self.gpa);
-            // Collect floating windows that are in tree but should be removed
-            const r: *Node = &root.*.?;
-            // We cannot easily enumerate tree, so iterate all windows and check
-            var it = Nile.Window.iter();
-            while (it.next()) |win| {
-                if (win.wm_requested.workspace != current_ws) continue;
-                if (win.isEffectivelyFloating() and r.find(win) != null) {
-                    wins.append(self.gpa, win) catch unreachable;
-                }
-            }
-            for (wins.items) |win| {
-                if (r.find(win)) |n| {
-                    if (r.* == .leaf) {
-                        root.* = null;
-                        break;
-                    } else if (r.findParent(n)) |p| {
-                        p.pop(p.branch.first == n);
-                    }
-                }
-            }
-            if (root.* == null) return;
-        }
         var it = Nile.Window.iter();
         while (it.next()) |win| {
-            if (win.wm_requested.workspace != current_ws) continue;
-            if (win.isEffectivelyFloating()) continue;
+            if (!isTileable(win, current_ws)) continue;
             const r: *Node = &root.*.?;
             if (r.find(win) != null) continue;
             const drop_x: i32 = @intCast(@max(0, win.box.x));

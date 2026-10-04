@@ -128,13 +128,20 @@ pub const LayerShellOpts = struct {
 
     pub fn waylandConfig(self: @This(), size: dvui.Size) WaylandContext.Config {
         // dvui.Size w/h are f32; clamp to u32, 0 = let compositor decide (anchored axis)
-        const w: u32 = if (size.w > 0) @intFromFloat(@round(size.w)) else 0;
-        const h: u32 = if (size.h > 0) @intFromFloat(@round(size.h)) else 0;
+        const mask = self.anchorMask();
+        // An axis anchored at both edges must request 0: the compositor
+        // ignores the anchors for that axis when the client pins a size,
+        // and centers the surface at that size instead of stretching it
+        // (zwlr_layer_shell_v1.set_size). Swaybg always sends 0 and fills
+        // the output; a non-zero request here is what left the wallpaper
+        // a fixed box in the middle of a larger monitor.
+        const w: u32 = if (mask.left and mask.right) 0 else if (size.w > 0) @intFromFloat(@round(size.w)) else 0;
+        const h: u32 = if (mask.top and mask.bottom) 0 else if (size.h > 0) @intFromFloat(@round(size.h)) else 0;
         return .{
             .width = w,
             .height = h,
             .layer = self.waylandLayer(),
-            .anchor = self.anchorMask(),
+            .anchor = mask,
             .margins = self.padding,
             .exclusive_zone = self.exclusive_zone,
             .namespace = self.namespace,

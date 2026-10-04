@@ -264,9 +264,10 @@ pub const Node = union(enum) {
     /// drop_x/drop_y is the cursor position where the window was dropped (for tiling placement).
     /// orientation is the split direction for the new branch, or null for horizontal default.
     pub fn append(self: *Node, alloc: std.mem.Allocator, new: *Window, drop_x: i32, drop_y: i32) void {
-        // A window must never occupy two leaves: the second leaf splits the tree
-        // again but only one of the two boxes is ever drawn, so the other half of
-        // the screen stays permanently empty. `find` is pointer-identity only.
+        // A window must never occupy two leaves: the second append splits the
+        // tree again but only one of the two boxes is ever drawn, so the other
+        // half of the screen stays permanently empty. `find` is
+        // pointer-identity only.
         if (self.find(new) != null) return;
         switch (self.*) {
             .leaf => |l| {
@@ -374,6 +375,40 @@ pub fn construct(alloc: std.mem.Allocator, wins: []const *Window) ?Node {
         }
     }
     return n;
+}
+
+/// True when `win` is a background window: a live toplevel that paints
+/// nothing, so it must not hold a tile.
+///
+/// This is the tiling-side notion of the shell's own chrome — the bar, the
+/// tophub overlay and the wallpaper — none of which the user tiles. Those
+/// avoid the problem structurally, by being layer surfaces rather than
+/// toplevels. A background toplevel is the same category arriving through the
+/// toplevel path, so it gets the same rule here.
+///
+/// `Nile.Window.iter()` walks every live toplevel, including the ones that
+/// never map: a client may hold a toplevel it never shows (background helper,
+/// tray, probe), and `.init` is also the state a window passes through after
+/// its closed event and before destruction. `window_add` fires at `.ready`,
+/// one step before `window_map` promotes it to `.mapped`, so without this
+/// check an arrange in that gap tiles a window that will never draw — which is
+/// what leaves a permanently empty slice of the workspace beside the windows
+/// you can actually see.
+///
+/// `.closing` is deliberately *not* a background window: an unmapped window
+/// keeps its saved buffer alive for frame perfection, so it still occupies its
+/// box until it is destroyed.
+fn isBackgroundWindow(win: *Window) bool {
+    return win.state != .mapped and win.state != .closing;
+}
+
+/// A window may hold a tile in the tiling tree of `ws` only when all three
+/// hold: it is on `ws`, it is not floating (forced or via workspace mode), and
+/// it is not a background window.
+fn isTileable(win: *Window, ws: u64) bool {
+    if (win.wm_requested.workspace != ws) return false;
+    if (win.isEffectivelyFloating()) return false;
+    return !isBackgroundWindow(win);
 }
 
 pub const NileCompositor = struct {
@@ -615,6 +650,14 @@ pub const NileCompositor = struct {
             self.raiseFloatingWindows();
             return;
         }
+        // Background window: a toplevel the client has created but not mapped
+        // yet. It holds no tile now — `onWindowMap` attaches it once there is
+        // something to paint. Tiling it here would reserve a slice of the
+        // workspace that no window ever draws.
+        if (isBackgroundWindow(win)) {
+            log.debug("Window added in background, awaiting map", .{});
+            return;
+        }
         if (self.cur().*) |*r| {
             const drop_x: i32 = @intCast(@max(0, win.box.x));
             const drop_y: i32 = @intCast(@max(0, win.box.y));
@@ -638,9 +681,10 @@ pub const NileCompositor = struct {
             return;
         }
         Nile.Window.focus(win);
-        // `ensureCurrentTree` only ever tiles mapped windows, but `onWindowAdd`
-        // runs at `.ready` — one step earlier. Any arrange between the two drops
-        // this window again, so re-attach on map and apply geometry.
+        // The window was a background window while `onWindowAdd` ran, so it was
+        // never given a tile. Now that it paints, reconcile the tree: this both
+        // attaches it and prunes any background window that has been sitting in
+        // the tree, then apply the resulting geometry.
         self.ensureCurrentTree();
         self.layoutCurrent();
     }
@@ -649,10 +693,11 @@ pub const NileCompositor = struct {
         // The focused window went away (minimize/close): fall back so
         // input never rests on a gone window.
         self.refocusAfterWindowGone(win);
-        // An unmapped window must not keep holding a tile: this is the release
-        // point for anything that unmaps without being destroyed.
-        self.ensureCurrentTree();
-        self.layoutCurrent();
+        // The window keeps its tile while closing: an unmapped window is in
+        // `.closing` and still paints its saved buffer (see
+        // `isBackgroundWindow`), so releasing the tile now would make every
+        // other window resize underneath the close animation. `onWindowDestroy`
+        // is where the tile goes away.
     }
 
     fn onWindowDestroy(self: *NileCompositor, win: *Window) void {
@@ -1233,6 +1278,13 @@ pub const NileCompositor = struct {
     /// Empty workspaces (no windows, root == null) are fully supported — the
     /// outgoing workspace slides/fades out and the incoming stays empty.
     fn onWorkspaceSwitched(self: *NileCompositor, old_id: u64, new_id: u64) void {
+        // Reconcile before anything reads the incoming workspace's tree: this
+        // attaches windows that could not take a tile while they were in the
+        // background (see `isBackgroundWindow`) and drops occupants that must no
+        // longer hold one. Without it a workspace switched to with the
+        // no-animation path below would only ever lay out the tree it already
+        // had.
+        self.ensureCurrentTree();
         // If switching to a floating workspace that was toggled while not current,
         // its tiled windows are still at tiled positions — cascade them now so they overlap.
         if (server.workspace.getEffectiveMode(new_id) == .floating) {
@@ -1506,10 +1558,10 @@ pub const NileCompositor = struct {
             return;
         }
         const new_root = self.rootFor(new_id);
-        // Only mapped, non-floating windows take a tile on the destination —
-        // an unmapped window inserted here would split the tree and reserve
-        // empty space until the next arrange prunes it.
-        if (!isTileable(win, new_id)) {
+        // A background window takes no tile on the destination either: it is
+        // attached when it maps (see `onWindowMap`), or on the next arrange of
+        // that workspace.
+        if (isBackgroundWindow(win)) {
             if (new_root == self.cur()) self.layoutCurrent();
             self.raiseFloatingWindows();
             return;
@@ -1534,26 +1586,11 @@ pub const NileCompositor = struct {
         self.layoutCurrent();
     }
 
-    /// A window may hold a tile in the tiling tree of `ws` only when all three
-    /// hold: it is on `ws`, it is not floating (forced or via workspace mode),
-    /// and it is actually mapped.
-    ///
-    /// The `mapped` half is the important one. `Nile.Window.iter()` walks every
-    /// live `Window`, including ones still in `.init`/`.ready`/`.initialized`
-    /// (client has a toplevel but never mapped it) and ones in `.closing`.
-    /// Tiling any of those reserves a tile that no visible window ever paints,
-    /// which is what leaves a permanently empty slice of the workspace next to
-    /// the windows you can actually see.
-    fn isTileable(win: *Window, ws: u64) bool {
-        if (win.wm_requested.workspace != ws) return false;
-        if (win.isEffectivelyFloating()) return false;
-        return win.state == .mapped;
-    }
-
     /// Attach any current-workspace windows missing from its tree (e.g. first
     /// show, or windows assigned while this policy wasn't registered).
     /// Existing splits/ratios are preserved — nothing is ever rebuilt here.
-    /// Floating windows (forced or workspace mode floating) are never added to the tiling tree.
+    /// Windows that must not hold a tile (floating, another workspace, or a
+    /// background window) are never added to the tree.
     fn ensureCurrentTree(self: *NileCompositor) void {
         const current_ws = server.workspace.currentWorkspace();
         // Reconcile against the live set first: any leaf whose window is
@@ -1573,15 +1610,29 @@ pub const NileCompositor = struct {
         const mode = server.workspace.getEffectiveMode(current_ws);
         if (mode == .floating) return;
         const root = self.cur();
-        if (root.* != null) {
-            // Prune windows that are in the tree but must no longer hold a tile
-            // (toggled floating, moved away, unmapped or closing). Without this a
-            // window that stops being tileable keeps its slice of the workspace
-            // forever. We cannot enumerate the tree, so iterate all windows and
-            // check membership instead.
+        if (root.* == null) {
+            // No tree at all: build it from the windows that may hold a tile
+            // right now.
+            var wins = std.ArrayList(*Window).empty;
+            defer wins.deinit(self.gpa);
+            var it = Nile.Window.iter();
+            while (it.next()) |win| {
+                if (!isTileable(win, current_ws)) continue;
+                wins.append(self.gpa, win) catch unreachable;
+            }
+            if (wins.items.len == 0) return;
+            root.* = construct(self.gpa, wins.items);
+            return;
+        }
+        // Prune windows that are lingering in the tree but must no longer hold
+        // a tile: toggled floating, moved to another workspace, or turned into
+        // a background window. Without this a window that stops being tileable
+        // keeps its slice of the workspace forever.
+        {
             var stale = std.ArrayList(*Window).empty;
             defer stale.deinit(self.gpa);
             const r: *Node = &root.*.?;
+            // We cannot easily enumerate tree, so iterate all windows and check
             var it = Nile.Window.iter();
             while (it.next()) |win| {
                 if (isTileable(win, current_ws)) continue;
@@ -1601,20 +1652,7 @@ pub const NileCompositor = struct {
                     }
                 }
             }
-        }
-        if (root.* == null) {
-            // No tree, or the prune above collapsed the last one away: build it
-            // from the windows that are actually tileable right now.
-            var wins = std.ArrayList(*Window).empty;
-            defer wins.deinit(self.gpa);
-            var it = Nile.Window.iter();
-            while (it.next()) |win| {
-                if (!isTileable(win, current_ws)) continue;
-                wins.append(self.gpa, win) catch unreachable;
-            }
-            if (wins.items.len == 0) return;
-            root.* = construct(self.gpa, wins.items);
-            return;
+            if (root.* == null) return;
         }
         var it = Nile.Window.iter();
         while (it.next()) |win| {

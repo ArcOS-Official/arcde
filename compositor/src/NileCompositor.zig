@@ -644,8 +644,13 @@ pub const NileCompositor = struct {
         if (win.isEffectivelyFloating()) {
             log.debug("Window added as floating (workspace mode {s}, forced {any})", .{ @tagName(server.workspace.getEffectiveMode(current_ws)), win.floating });
             self.ensureFloatingPosition(win);
+            // Floating layout never sets a tile, so propose the initial
+            // dimensions ourselves: a window in .ready cannot advance to
+            // .initialized (and so never gets its first configure) until
+            // something fills wm_requested.dimensions.
+            self.requestInitialGeometry(win);
             // Ensure it's on top after layout
-            self.layoutCurrent();
+            self.layoutCurrent(true);
             Nile.Window.raiseToTop(win);
             self.raiseFloatingWindows();
             return;
@@ -656,6 +661,13 @@ pub const NileCompositor = struct {
         // workspace that no window ever draws.
         if (isBackgroundWindow(win)) {
             log.debug("Window added in background, awaiting map", .{});
+            // It must still be configured once so the client can map: a
+            // window stuck in .ready never becomes paintable, which is what
+            // made windows never appear. Propose transient dimensions only —
+            // but do NOT touch window.box or add it to the tiling tree.
+            // onWindowMap reconciles it into a real tile as soon as it is
+            // mapped.
+            self.requestInitialGeometry(win);
             return;
         }
         if (self.cur().*) |*r| {
@@ -665,11 +677,11 @@ pub const NileCompositor = struct {
             if (r.find(win)) |node| {
                 log.debug("New node: {}", .{@intFromPtr(node)});
             }
-            self.layoutTree(r);
+            self.layoutTree(r, true);
         } else {
             log.debug("First window on workspace, creating root", .{});
             self.cur().* = .{ .leaf = win };
-            self.layoutCurrent();
+            self.layoutCurrent(true);
         }
         self.raiseFloatingWindows();
     }
@@ -684,9 +696,13 @@ pub const NileCompositor = struct {
         // The window was a background window while `onWindowAdd` ran, so it was
         // never given a tile. Now that it paints, reconcile the tree: this both
         // attaches it and prunes any background window that has been sitting in
-        // the tree, then apply the resulting geometry.
+        // the tree, then apply the resulting geometry. Immediate (no reflow
+        // animation): Window.map()'s open animation reads window.box as its
+        // target right after this notify returns, so the box must already be
+        // the tile — a mid-flight animation target freezes the window at its
+        // transient position.
         self.ensureCurrentTree();
-        self.layoutCurrent();
+        self.layoutCurrent(false);
     }
 
     fn onWindowUnmap(self: *NileCompositor, win: *Window) void {
@@ -720,7 +736,7 @@ pub const NileCompositor = struct {
                     if (r.leaf == win) {
                         root.* = null;
                         log.debug("Root deleted", .{});
-                        if (ws_id == cur_id) self.layoutCurrent();
+                        if (ws_id == cur_id) self.layoutCurrent(true);
                     }
                     continue;
                 }
@@ -732,9 +748,9 @@ pub const NileCompositor = struct {
                 if (ws_id == cur_id) {
                     const mode = server.workspace.getEffectiveMode(ws_id);
                     if (mode == .floating) {
-                        self.layoutCurrent();
+                        self.layoutCurrent(true);
                     } else {
-                        self.layoutTree(r);
+                        self.layoutTree(r, true);
                     }
                 }
             }
@@ -842,7 +858,7 @@ pub const NileCompositor = struct {
         if (new_mode == .tiling) {
             self.ensureCurrentTree();
         }
-        self.layoutCurrent();
+        self.layoutCurrent(true);
         self.raiseFloatingWindows();
         Nile.dirtyWindowing();
         Nile.dirtyRendering();
@@ -889,7 +905,7 @@ pub const NileCompositor = struct {
                         p.pop(p.branch.first == n);
                         if (root == self.cur()) {
                             const m = server.workspace.getEffectiveMode(win.wm_requested.workspace);
-                            if (m == .floating) self.layoutCurrent() else self.layoutTree(r);
+                            if (m == .floating) self.layoutCurrent(true) else self.layoutTree(r, true);
                         }
                     }
                 }
@@ -932,7 +948,7 @@ pub const NileCompositor = struct {
                 } else {
                     root.* = .{ .leaf = win };
                 }
-                if (root == self.cur()) self.layoutCurrent();
+                if (root == self.cur()) self.layoutCurrent(true);
             }
         }
         self.raiseFloatingWindows();
@@ -1080,6 +1096,34 @@ pub const NileCompositor = struct {
         }
     }
 
+    /// Propose initial dimensions for a just-added window that will not
+    /// immediately take a tile (a background toplevel awaiting its first
+    /// map). `Window.manageFinish` refuses to advance the window out of
+    /// `.ready` until `wm_requested.dimensions` (or a fullscreen request)
+    /// is set, so without this the client never receives its first
+    /// configure and can never map. Sets only the requested dimensions —
+    /// deliberately NOT window.box: a geometry set here is a transient
+    /// first configure, and Window.map()'s open animation reads window.box
+    /// as its target, so poisoning it pins the window at a transient
+    /// position. onWindowMap tiles the window for real.
+    fn requestInitialGeometry(self: *NileCompositor, win: *Window) void {
+        _ = self;
+        if (win.impl != .toplevel) return;
+        if (win.wm_requested.dimensions != null) return;
+        var w: i32 = 800;
+        var h: i32 = 600;
+        if (Nile.Output.primary()) |out| {
+            const nea = Nile.Layer.nonExclusiveArea(out);
+            w = @min(800, @divTrunc(nea.width * 3, 4));
+            h = @min(600, @divTrunc(nea.height * 3, 4));
+        }
+        win.wm_requested.dimensions = .{
+            .width = @intCast(w),
+            .height = @intCast(h),
+        };
+        Nile.dirtyWindowing();
+    }
+
     /// Place a tiled window that is becoming floating near its tiling position with a small offset
     /// so it visibly pops out of layout. Uses natural size if available.
     fn placeTiledAsFloating(self: *NileCompositor, win: *Window, cascade_idx: i32) void {
@@ -1203,7 +1247,7 @@ pub const NileCompositor = struct {
             // tiling -> floating: cascade tiled windows so they visually overlap in focus order
             self.cascadeTiledToFloating(id);
         }
-        self.layoutCurrent();
+        self.layoutCurrent(true);
         self.raiseFloatingWindows();
         Nile.dirtyWindowing();
         Nile.dirtyRendering();
@@ -1226,7 +1270,7 @@ pub const NileCompositor = struct {
                         p.pop(p.branch.first == n);
                         if (root == self.cur()) {
                             const m = server.workspace.getEffectiveMode(win.wm_requested.workspace);
-                            if (m == .floating) self.layoutCurrent() else self.layoutTree(r);
+                            if (m == .floating) self.layoutCurrent(true) else self.layoutTree(r, true);
                         }
                     }
                 }
@@ -1261,7 +1305,7 @@ pub const NileCompositor = struct {
                 } else {
                     root.* = .{ .leaf = win };
                 }
-                if (root == self.cur()) self.layoutCurrent();
+                if (root == self.cur()) self.layoutCurrent(true);
             } else {
                 Nile.Window.raiseToTop(win);
             }
@@ -1293,19 +1337,19 @@ pub const NileCompositor = struct {
         const Anim = @import("Animation.zig");
         const cfg = Anim.get().workspace_switch;
         if (!Anim.get().isWorkspaceSwitchEnabled()) {
-            self.layoutCurrent();
+            self.layoutCurrent(true);
             self.raiseFloatingWindows();
             self.updateFocusForWorkspace(new_id);
             return;
         }
         const out = Nile.Output.primary() orelse {
-            self.layoutCurrent();
+            self.layoutCurrent(true);
             self.updateFocusForWorkspace(new_id);
             return;
         };
         const nea = Nile.Layer.nonExclusiveArea(out);
         if (nea.width == 0 or nea.height == 0) {
-            self.layoutCurrent();
+            self.layoutCurrent(true);
             self.updateFocusForWorkspace(new_id);
             return;
         }
@@ -1321,7 +1365,7 @@ pub const NileCompositor = struct {
         const easing = cfg.easing;
         switch (cfg.kind) {
             .none => {
-                self.layoutCurrent();
+                self.layoutCurrent(true);
                 self.updateFocusForWorkspace(new_id);
             },
             .slide => {
@@ -1541,9 +1585,9 @@ pub const NileCompositor = struct {
                 const old_mode = server.workspace.getEffectiveMode(old_id);
                 if (old_mode == .floating) {
                     // Floating workspace: keep floating positions, don't retile
-                    self.layoutCurrent();
+                    self.layoutCurrent(true);
                 } else {
-                    if (old_root.*) |*rr| self.layoutTree(rr) else self.layoutCurrent();
+                    if (old_root.*) |*rr| self.layoutTree(rr, true) else self.layoutCurrent(true);
                 }
             }
         }
@@ -1562,7 +1606,7 @@ pub const NileCompositor = struct {
         // attached when it maps (see `onWindowMap`), or on the next arrange of
         // that workspace.
         if (isBackgroundWindow(win)) {
-            if (new_root == self.cur()) self.layoutCurrent();
+            if (new_root == self.cur()) self.layoutCurrent(true);
             self.raiseFloatingWindows();
             return;
         }
@@ -1570,10 +1614,10 @@ pub const NileCompositor = struct {
             const drop_x: i32 = @intCast(@max(0, win.box.x));
             const drop_y: i32 = @intCast(@max(0, win.box.y));
             r.append(self.gpa, win, drop_x, drop_y);
-            if (new_root == self.cur()) self.layoutTree(r);
+            if (new_root == self.cur()) self.layoutTree(r, true);
         } else {
             new_root.* = .{ .leaf = win };
-            if (new_root == self.cur()) self.layoutCurrent();
+            if (new_root == self.cur()) self.layoutCurrent(true);
         }
         self.raiseFloatingWindows();
     }
@@ -1583,7 +1627,7 @@ pub const NileCompositor = struct {
     /// splits/ratios survive.
     pub fn arrange(self: *NileCompositor) void {
         self.ensureCurrentTree();
-        self.layoutCurrent();
+        self.layoutCurrent(true);
     }
 
     /// Attach any current-workspace windows missing from its tree (e.g. first
@@ -1666,7 +1710,7 @@ pub const NileCompositor = struct {
     }
 
     /// Apply the current workspace tree's geometry to its windows.
-    fn layoutCurrent(self: *NileCompositor) void {
+    fn layoutCurrent(self: *NileCompositor, animate: bool) void {
         const cur_id = server.workspace.currentWorkspace();
         const mode = server.workspace.getEffectiveMode(cur_id);
         if (mode == .floating) {
@@ -1682,7 +1726,7 @@ pub const NileCompositor = struct {
             Nile.dirtyRendering();
             return;
         }
-        if (self.cur().*) |*r| self.layoutTree(r) else {
+        if (self.cur().*) |*r| self.layoutTree(r, animate) else {
             // No tiling tree but maybe floating windows need raise
             self.raiseFloatingWindows();
             Nile.dirtyRendering();
@@ -1690,7 +1734,7 @@ pub const NileCompositor = struct {
     }
 
     /// Apply one tree's geometry. Pure layout — never mutates the tree.
-    fn layoutTree(self: *NileCompositor, r: *Node) void {
+    fn layoutTree(self: *NileCompositor, r: *Node, animate: bool) void {
         const out = Nile.Output.primary() orelse return;
         const box = Nile.Layer.nonExclusiveArea(out);
         if (box.width == 0 or box.height == 0) return;
@@ -1699,7 +1743,7 @@ pub const NileCompositor = struct {
             .y = @intCast(box.y),
             .w = @intCast(box.width),
             .h = @intCast(box.height),
-        }, r, true);
+        }, r, animate);
         // After tiling, raise any floating windows above tiled ones on this workspace
         self.raiseFloatingWindows();
         Nile.dirtyWindowing();
@@ -1784,7 +1828,7 @@ pub const NileCompositor = struct {
                     root.* = null;
                 } else if (r.findParent(n)) |p| {
                     p.pop(p.branch.first == n);
-                    if (root == self.cur()) self.layoutTree(r);
+                    if (root == self.cur()) self.layoutTree(r, true);
                 }
             }
         }
@@ -1818,7 +1862,7 @@ pub const NileCompositor = struct {
                     root.* = .{ .leaf = win };
                 }
             }
-            if (root == self.cur()) self.layoutCurrent();
+            if (root == self.cur()) self.layoutCurrent(true);
         }
         self.raiseFloatingWindows();
         Nile.dirtyWindowing();
@@ -1842,7 +1886,7 @@ pub const NileCompositor = struct {
                             root.* = null;
                         } else if (r.findParent(n)) |p| {
                             p.pop(p.branch.first == n);
-                            if (root == self.cur()) self.layoutTree(r);
+                            if (root == self.cur()) self.layoutTree(r, true);
                         }
                     }
                 }
@@ -1879,7 +1923,7 @@ pub const NileCompositor = struct {
                             root.* = .{ .leaf = win };
                         }
                     }
-                    if (root == self.cur()) self.layoutCurrent();
+                    if (root == self.cur()) self.layoutCurrent(true);
                 }
                 self.raiseFloatingWindows();
                 // Keep focused window on top if it was the maximized one

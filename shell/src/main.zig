@@ -366,7 +366,7 @@ fn frame() !dvui.App.Result {
                 .border = .all(1),
                 .corners = .all(10),
                 .min_size_content = .{ .h = 48.0, .w = (32 * 9) + (6 * 7) },
-                .padding = .fromSize(.{ .w = 4 }),
+                .padding = .{ .w = 4, .x = 4 },
                 .gravity_y = 0.5,
             },
         );

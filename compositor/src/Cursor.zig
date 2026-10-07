@@ -56,6 +56,14 @@ const Mode = union(enum) {
 };
 
 const default_size = 24;
+const default_theme: [*:0]const u8 = "macOS";
+
+/// Resolve the cursor theme to use: XCURSOR_THEME env var if set, otherwise
+/// the hardcoded default.
+pub fn resolveThemeName() ?[*:0]const u8 {
+    if (std.c.getenv("XCURSOR_THEME")) |env| return env;
+    return default_theme;
+}
 
 const Image = union(enum) {
     /// No cursor image
@@ -140,7 +148,7 @@ pub fn init(cursor: *Cursor, seat: *Seat) !void {
     // This is here so that cursor.xcursor_manager doesn't need to be an
     // optional pointer. This isn't optimal as it does a needless allocation,
     // but this is not a hot path.
-    const xcursor_manager = try wlr.XcursorManager.create(null, default_size);
+    const xcursor_manager = try wlr.XcursorManager.create(resolveThemeName(), default_size);
     errdefer xcursor_manager.destroy();
 
     cursor.* = .{
@@ -148,7 +156,7 @@ pub fn init(cursor: *Cursor, seat: *Seat) !void {
         .wlr_cursor = wlr_cursor,
         .xcursor_manager = xcursor_manager,
     };
-    try cursor.setTheme(null, null);
+    try cursor.setTheme(resolveThemeName(), null);
 
     seat.wlr_seat.events.request_set_cursor.add(&cursor.request_set_cursor);
 
@@ -220,7 +228,7 @@ pub fn deinit(cursor: *Cursor) void {
 pub fn setTheme(cursor: *Cursor, theme: ?[*:0]const u8, _size: ?u32) !void {
     const size = _size orelse default_size;
 
-    const xcursor_manager = try wlr.XcursorManager.create(theme, size);
+    const xcursor_manager = try wlr.XcursorManager.create(theme orelse resolveThemeName(), size);
     errdefer xcursor_manager.destroy();
 
     // If this cursor belongs to the default seat, update the Xwayland cursor to match the theme.

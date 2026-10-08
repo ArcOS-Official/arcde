@@ -4,6 +4,21 @@ const Icons = @import("Icons.zig");
 const AlignedEntry = @import("AlignedEntry.zig");
 const State = @import("State.zig");
 
+const c_tm = extern struct {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    zone: ?[*:0]const u8,
+    gmtoff: c_long,
+};
+extern "c" fn localtime_r(timep: *const std.c.time_t, result: *c_tm) ?*c_tm;
+
 hubmode: HubMode = .clock,
 last_hubmode: HubMode = .clock,
 anim_id: dvui.Id = undefined,
@@ -2963,15 +2978,14 @@ pub fn clockLabels(self: *HubUi, state: *State, t: *dvui.Theme, centered: bool) 
     _ = self;
     const ts = std.Io.Clock.real.now(state.io);
     const s = ts.toSeconds();
-    const stamp = std.time.epoch.EpochSeconds{ .secs = @intCast(s) };
-    const ds = stamp.getDaySeconds();
-    const d = stamp.getEpochDay();
-    const dy = d.calculateYearDay();
+    var tm: c_tm = undefined;
+    const sec: std.c.time_t = @intCast(s);
+    _ = localtime_r(&sec, &tm);
     const ax: f32 = if (centered) 0.5 else 0.0;
     const txt = std.fmt.allocPrint(state.alloc, "{}:{}:{}", .{
-        ds.getHoursIntoDay(),
-        ds.getMinutesIntoHour(),
-        ds.getSecondsIntoMinute(),
+        tm.hour,
+        tm.min,
+        tm.sec,
     }) catch return;
     defer state.alloc.free(txt);
     dvui.labelNoFmt(
@@ -2986,19 +3000,18 @@ pub fn clockLabels(self: *HubUi, state: *State, t: *dvui.Theme, centered: bool) 
         },
     );
     const dw = [_][]const u8{
-        "Thursday", "Friday",  "Saturday",  "Sunday",
-        "Monday",   "Tuesday", "Wednesday",
+        "Sunday", "Monday",   "Tuesday",  "Wednesday",
+        "Thursday", "Friday", "Saturday",
     };
     const ms = [_][]const u8{
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     };
-    const dname = dw[@as(usize, @intCast(@divFloor(s, 86400))) % dw.len];
-    const dm = dy.calculateMonthDay();
+    const dname = dw[@intCast(tm.wday)];
     const txt_ = std.fmt.allocPrint(state.alloc, "{s}, {s} {}", .{
         dname,
-        ms[dm.month.numeric() - 1],
-        dm.day_index + 1,
+        ms[@intCast(tm.mon)],
+        tm.mday,
     }) catch return;
     defer state.alloc.free(txt_);
     dvui.labelNoFmt(
